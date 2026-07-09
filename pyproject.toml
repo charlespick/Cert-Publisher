@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cert-publisher"
+version = "0.1.0"
+description = "Publish cert-manager certificates to non-Kubernetes hosts over SSH and WinRM"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Charles Pick", email = "me@charlespick.xyz" }]
+dependencies = [
+  "kubernetes>=29.0.0",
+  "paramiko>=3.4.0",
+  "pywinrm>=0.4.3",
+  "cryptography>=42.0.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+cert-publisher = "cert_publisher.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

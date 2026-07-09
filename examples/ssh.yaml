@@ -1,0 +1,43 @@
+# Publish a certificate to a Linux host over SSH and reload nginx.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: web01-ssh
+  namespace: default
+type: Opaque
+stringData:
+  # Provide exactly one of password or privateKey (+ optional passphrase).
+  privateKey: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    ...replace me...
+    -----END OPENSSH PRIVATE KEY-----
+---
+apiVersion: certpublisher.charlespick.xyz/v1alpha1
+kind: CertPublication
+metadata:
+  name: web01
+  namespace: default
+spec:
+  dnsNames:
+    - web01.example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  # Optional cert-manager passthrough:
+  # duration: 2160h
+  # renewBefore: 360h
+  provisioner:
+    type: ssh
+    ssh:
+      host: web01.example.com
+      port: 22
+      username: certbot
+      hostFingerprint: "SHA256:REPLACE_WITH_HOST_KEY_FINGERPRINT"
+      auth:
+        secretRef:
+          name: web01-ssh
+      certPath: /etc/ssl/certs/web01.pem
+      keyPath: /etc/ssl/private/web01.key
+      fileMode: "0644"
+      keyFileMode: "0600"
+      postInstallScript: systemctl reload nginx
