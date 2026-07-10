@@ -7,6 +7,7 @@ import logging
 from .certmanager import build_certificate_body
 from .kube import Kube
 from .provisioners import build_provisioner
+from .status import PENDING, PUBLISHED, set_status
 from .utils import sha256_fingerprint
 
 log = logging.getLogger("cert-publisher.reconcile")
@@ -26,12 +27,14 @@ def reconcile_publication(kube: Kube, pub: dict) -> None:
         log.info("[%s] creating cert-manager Certificate", ref)
         kube.create_certificate(namespace, build_certificate_body(pub, secret_name))
         log.info("[%s] Certificate created; will publish once it is issued", ref)
+        set_status(kube, pub, PENDING, "Certificate created; awaiting issuance")
         return
 
     # 2. The Certificate exists; wait until cert-manager has populated the Secret.
     secret = kube.get_secret(namespace, secret_name)
     if secret is None or not secret.data or "tls.crt" not in secret.data:
         log.info("[%s] certificate not yet issued, waiting", ref)
+        set_status(kube, pub, PENDING, "Awaiting certificate issuance")
         return
 
     data = kube.secret_data(secret)
@@ -43,9 +46,17 @@ def reconcile_publication(kube: Kube, pub: dict) -> None:
     prov = build_provisioner(spec["provisioner"], kube, namespace)
     if prov.is_current(cert_pem):
         log.info("[%s] installed certificate is up to date (%s)", ref, desired[:16])
+        set_status(
+            kube, pub, PUBLISHED, "Certificate up to date",
+            published_fingerprint=desired,
+        )
         return
 
     # 4. Publish.
     log.info("[%s] publishing certificate %s", ref, desired[:16])
     prov.install(cert_pem, key_pem)
     log.info("[%s] certificate published", ref)
+    set_status(
+        kube, pub, PUBLISHED, "Certificate published",
+        published_fingerprint=desired, mark_published=True,
+    )

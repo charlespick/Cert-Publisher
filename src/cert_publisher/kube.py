@@ -53,6 +53,13 @@ class Kube:
             CM_GROUP, CM_VERSION, namespace, CM_PLURAL, body
         )
 
+    def patch_publication_status(self, namespace: str, name: str, status: dict) -> None:
+        # Merge patch against the /status subresource: omitted fields are
+        # preserved, so callers only set what changed.
+        self.custom.patch_namespaced_custom_object_status(
+            GROUP, VERSION, namespace, PLURAL, name, {"status": status}
+        )
+
     def get_secret(self, namespace: str, name: str):
         try:
             return self.core.read_namespaced_secret(name, namespace)

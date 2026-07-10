@@ -30,6 +30,17 @@ Because the compare step is fingerprint-based and cert-manager drives renewal
 timing, the job is idempotent: it's a no-op until there's genuinely new
 material to push.
 
+Each reconcile records its outcome on the resource's `.status` (phase,
+message, the published leaf fingerprint, and last-published/last-reconcile
+timestamps), so `kubectl get certpublications` shows what's been pushed and
+`kubectl describe` surfaces the last error:
+
+```
+NAME    DNS                  PROVISIONER   PHASE       PUBLISHED
+web01   web01.example.com    ssh           Published   5m
+win01   win01.example.com    winrm         Pending     
+```
+
 ```
 cert-manager  ──issues──▶  Secret (tls.crt/tls.key)
                                 │

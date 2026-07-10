@@ -15,6 +15,8 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      subresources:
+        status: {}
       additionalPrinterColumns:
         - name: DNS
           type: string
@@ -22,9 +24,12 @@ spec:
         - name: Provisioner
           type: string
           jsonPath: .spec.provisioner.type
-        - name: Target
+        - name: Phase
           type: string
-          jsonPath: .spec.provisioner.ssh.host
+          jsonPath: .status.phase
+        - name: Published
+          type: date
+          jsonPath: .status.lastPublishedTime
       schema:
         openAPIV3Schema:
           type: object
@@ -153,3 +158,23 @@ spec:
                           type: string
                         postInstallScript:
                           type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Pending, Published, or Error.
+                message:
+                  type: string
+                publishedFingerprint:
+                  type: string
+                  description: SHA-256 fingerprint of the leaf last confirmed on the target.
+                lastPublishedTime:
+                  type: string
+                  format: date-time
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+                observedGeneration:
+                  type: integer
+                  format: int64

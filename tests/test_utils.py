@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from cert_publisher.certmanager import build_certificate_body
+from cert_publisher.status import PUBLISHED, set_status
 from cert_publisher.utils import leaf_pem, sha1_thumbprint, sha256_fingerprint
 
 
@@ -55,3 +56,36 @@ def test_build_certificate_body():
     assert body["spec"]["secretName"] == "web01-tls"
     assert body["spec"]["duration"] == "2160h"
     assert body["spec"]["dnsNames"] == ["web01.example.com"]
+
+
+class _FakeKube:
+    def __init__(self):
+        self.patched = None
+
+    def patch_publication_status(self, namespace, name, status):
+        self.patched = (namespace, name, status)
+
+
+def test_set_status_patches_expected_fields():
+    kube = _FakeKube()
+    pub = {"metadata": {"name": "web01", "namespace": "default", "generation": 3}}
+    set_status(
+        kube, pub, PUBLISHED, "Certificate published",
+        published_fingerprint="deadbeef", mark_published=True,
+    )
+    namespace, name, status = kube.patched
+    assert (namespace, name) == ("default", "web01")
+    assert status["phase"] == PUBLISHED
+    assert status["publishedFingerprint"] == "deadbeef"
+    assert status["observedGeneration"] == 3
+    assert "lastPublishedTime" in status
+    assert "lastReconcileTime" in status
+
+
+def test_set_status_omits_publish_time_when_not_marked():
+    kube = _FakeKube()
+    pub = {"metadata": {"name": "web01", "namespace": "default", "generation": 1}}
+    set_status(kube, pub, PUBLISHED, "up to date", published_fingerprint="abc")
+    _, _, status = kube.patched
+    assert "lastPublishedTime" not in status
+

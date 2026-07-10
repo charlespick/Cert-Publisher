@@ -8,6 +8,7 @@ import sys
 
 from .kube import Kube
 from .reconcile import reconcile_publication
+from .status import ERROR, set_status
 
 
 def _setup_logging() -> None:
@@ -33,8 +34,9 @@ def main() -> int:
         ref = f"{pub['metadata']['namespace']}/{pub['metadata']['name']}"
         try:
             reconcile_publication(kube, pub)
-        except Exception:  # keep going; one bad host shouldn't block the rest
+        except Exception as exc:  # keep going; one bad host shouldn't block the rest
             log.exception("[%s] reconcile failed", ref)
+            set_status(kube, pub, ERROR, str(exc))
             failures += 1
 
     if failures:
