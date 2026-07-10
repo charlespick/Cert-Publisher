@@ -79,7 +79,7 @@ spec:
                       enum: [ssh, winrm]
                     ssh:
                       type: object
-                      required: [host, username, hostFingerprint, certPath, keyPath]
+                      required: [host, username, hostFingerprint, auth, certPath, keyPath]
                       properties:
                         host:
                           type: string
@@ -93,14 +93,17 @@ spec:
                           description: OpenSSH SHA256 host key fingerprint, e.g. "SHA256:...".
                         auth:
                           type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies password and/or
+                            privateKey (+ optional passphrase).
                           properties:
                             secretRef:
                               type: object
                               required: [name]
                               properties:
                                 name:
-                                  type: string
-                                namespace:
                                   type: string
                         certPath:
                           type: string
@@ -116,7 +119,7 @@ spec:
                           type: string
                     winrm:
                       type: object
-                      required: [host, username, thumbprint]
+                      required: [host, username, thumbprint, auth]
                       properties:
                         host:
                           type: string
@@ -133,14 +136,16 @@ spec:
                           default: ntlm
                         auth:
                           type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies the password.
                           properties:
                             secretRef:
                               type: object
                               required: [name]
                               properties:
                                 name:
-                                  type: string
-                                namespace:
                                   type: string
                         mode:
                           type: string

@@ -35,15 +35,18 @@ def resolve_credentials(auth: dict, kube, namespace: str) -> Credentials:
     """Resolve ``auth.secretRef`` into concrete credentials.
 
     The referenced Secret may carry any of ``password``, ``privateKey`` and
-    ``passphrase`` keys.
+    ``passphrase`` keys, and must live in the same namespace as the
+    CertPublication — credential Secrets are never read cross-namespace.
     """
     ref = (auth or {}).get("secretRef")
     if not ref:
-        return Credentials()
+        raise ValueError("provisioner auth.secretRef is required")
 
-    secret = kube.get_secret(ref.get("namespace", namespace), ref["name"])
+    secret = kube.get_secret(namespace, ref["name"])
     if secret is None:
-        raise LookupError(f"auth secret {ref['name']!r} not found")
+        raise LookupError(
+            f"auth secret {ref['name']!r} not found in namespace {namespace!r}"
+        )
 
     data = kube.secret_data(secret)
 

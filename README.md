@@ -69,6 +69,14 @@ authenticates over the configured transport (NTLM by default), and either:
 
 Both modes support an optional post-install PowerShell script.
 
+### Credentials
+
+No secret material is ever stored in a `CertPublication`. Every provisioner's
+`auth.secretRef` points at a `Secret` **in the same namespace** as the
+publication, which supplies the SSH password/private key (+ optional
+passphrase) or the WinRM password. Host-identity values (`hostFingerprint`,
+`thumbprint`) are public verification data, not secrets, and stay in the spec.
+
 See [`examples/`](examples/) for full manifests.
 
 ## Deploying
