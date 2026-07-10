@@ -12,7 +12,7 @@ stringData:
     ...replace me...
     -----END OPENSSH PRIVATE KEY-----
 ---
-apiVersion: certpublisher.charlespick.xyz/v1alpha1
+apiVersion: certpublisher.makerland.xyz/v1alpha1
 kind: CertPublication
 metadata:
   name: web01

@@ -11,15 +11,15 @@ kind: ClusterRole
 metadata:
   name: cert-publisher
 rules:
-  - apiGroups: ["certpublisher.charlespick.xyz"]
+  - apiGroups: ["certpublisher.makerland.xyz"]
     resources: ["certpublications"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["certpublisher.charlespick.xyz"]
+  - apiGroups: ["certpublisher.makerland.xyz"]
     resources: ["certpublications/status"]
     verbs: ["get", "update", "patch"]
   # Required to set blockOwnerDeletion on owned Certificates in clusters that
   # enable OwnerReferencesPermissionEnforcement.
-  - apiGroups: ["certpublisher.charlespick.xyz"]
+  - apiGroups: ["certpublisher.makerland.xyz"]
     resources: ["certpublications/finalizers"]
     verbs: ["update"]
   # Certificates are looked up by name, created, and patched when the

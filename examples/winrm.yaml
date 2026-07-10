@@ -8,7 +8,7 @@ type: Opaque
 stringData:
   password: "replace-me"
 ---
-apiVersion: certpublisher.charlespick.xyz/v1alpha1
+apiVersion: certpublisher.makerland.xyz/v1alpha1
 kind: CertPublication
 metadata:
   name: win01

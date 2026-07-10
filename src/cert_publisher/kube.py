@@ -12,7 +12,7 @@ from kubernetes.client.rest import ApiException
 log = logging.getLogger("cert-publisher.kube")
 
 # The CertPublication custom resource this operator reconciles.
-GROUP = "certpublisher.charlespick.xyz"
+GROUP = "certpublisher.makerland.xyz"
 VERSION = "v1alpha1"
 PLURAL = "certpublications"
 

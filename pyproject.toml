@@ -9,7 +9,7 @@ description = "Publish cert-manager certificates to non-Kubernetes hosts over SS
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "Charles Pick", email = "me@charlespick.xyz" }]
+authors = [{ name = "Charles Pickering", email = "me@charlespick.xyz" }]
 dependencies = [
   "kubernetes>=29.0.0",
   "paramiko>=3.4.0",
