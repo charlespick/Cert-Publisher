@@ -17,12 +17,20 @@ rules:
   - apiGroups: ["certpublisher.charlespick.xyz"]
     resources: ["certpublications/status"]
     verbs: ["get", "update", "patch"]
+  # Required to set blockOwnerDeletion on owned Certificates in clusters that
+  # enable OwnerReferencesPermissionEnforcement.
+  - apiGroups: ["certpublisher.charlespick.xyz"]
+    resources: ["certpublications/finalizers"]
+    verbs: ["update"]
+  # Certificates are looked up by name, created, and patched when the
+  # publication spec changes; the operator never lists or watches them.
   - apiGroups: ["cert-manager.io"]
     resources: ["certificates"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "create", "update", "patch"]
+  # Secrets (issued material and auth) are only ever read by name.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

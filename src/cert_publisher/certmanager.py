@@ -21,14 +21,8 @@ def _owner_reference(pub: dict) -> dict:
     }
 
 
-def build_certificate_body(pub: dict, secret_name: str) -> dict:
-    """Build the cert-manager Certificate object for a CertPublication.
-
-    The Certificate is named after the publication and owned by it, so it is
-    garbage collected when the publication is deleted. cert-manager itself owns
-    the renewal/rotation policy via ``issuerRef``/``duration``/``renewBefore``.
-    """
-    meta = pub["metadata"]
+def build_certificate_spec(pub: dict, secret_name: str) -> dict:
+    """Build the cert-manager Certificate ``spec`` a CertPublication maps to."""
     spec = pub["spec"]
 
     cert_spec: dict = {
@@ -39,6 +33,17 @@ def build_certificate_body(pub: dict, secret_name: str) -> dict:
     for key in _PASSTHROUGH:
         if key in spec:
             cert_spec[key] = spec[key]
+    return cert_spec
+
+
+def build_certificate_body(pub: dict, secret_name: str) -> dict:
+    """Build the cert-manager Certificate object for a CertPublication.
+
+    The Certificate is named after the publication and owned by it, so it is
+    garbage collected when the publication is deleted. cert-manager itself owns
+    the renewal/rotation policy via ``issuerRef``/``duration``/``renewBefore``.
+    """
+    meta = pub["metadata"]
 
     return {
         "apiVersion": f"{CM_GROUP}/{CM_VERSION}",
@@ -48,5 +53,19 @@ def build_certificate_body(pub: dict, secret_name: str) -> dict:
             "namespace": meta["namespace"],
             "ownerReferences": [_owner_reference(pub)],
         },
-        "spec": cert_spec,
+        "spec": build_certificate_spec(pub, secret_name),
     }
+
+
+def certificate_spec_drift(existing: dict, pub: dict, secret_name: str) -> dict | None:
+    """Return the desired spec if the existing Certificate is out of date.
+
+    Only the fields this operator manages are compared, so cert-manager's own
+    defaulting (and any fields it adds) never registers as drift. Returns
+    ``None`` when the existing Certificate already matches the publication.
+    """
+    desired = build_certificate_spec(pub, secret_name)
+    current = existing.get("spec") or {}
+    if all(current.get(key) == value for key, value in desired.items()):
+        return None
+    return desired

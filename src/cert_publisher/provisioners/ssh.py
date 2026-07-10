@@ -15,6 +15,28 @@ from .base import Credentials, Provisioner, resolve_credentials
 
 log = logging.getLogger("cert-publisher.ssh")
 
+# Concrete key types tried, in turn, when loading an operator-supplied private
+# key. ``paramiko.PKey.from_private_key`` dispatches to the abstract base class,
+# which cannot actually parse key material, so we probe the concrete loaders.
+_KEY_TYPES = (
+    paramiko.Ed25519Key,
+    paramiko.ECDSAKey,
+    paramiko.RSAKey,
+)
+
+
+def _load_private_key(pem: str, passphrase: str | None) -> paramiko.PKey:
+    """Load a PEM private key of unknown type into a concrete Paramiko key."""
+    last_error: Exception | None = None
+    for key_type in _KEY_TYPES:
+        try:
+            return key_type.from_private_key(io.StringIO(pem), password=passphrase)
+        except paramiko.SSHException as exc:
+            last_error = exc
+    raise paramiko.SSHException(
+        f"unsupported or malformed SSH private key: {last_error}"
+    )
+
 
 class _FingerprintPolicy(paramiko.MissingHostKeyPolicy):
     """Pin the host key to an operator-supplied SHA-256 fingerprint.
@@ -89,9 +111,8 @@ class SSHProvisioner(Provisioner):
             "look_for_keys": False,
         }
         if self.credentials.private_key:
-            kwargs["pkey"] = paramiko.PKey.from_private_key(
-                io.StringIO(self.credentials.private_key),
-                password=self.credentials.passphrase,
+            kwargs["pkey"] = _load_private_key(
+                self.credentials.private_key, self.credentials.passphrase
             )
         elif self.credentials.password:
             kwargs["password"] = self.credentials.password

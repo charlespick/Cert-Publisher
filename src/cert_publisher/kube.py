@@ -53,6 +53,13 @@ class Kube:
             CM_GROUP, CM_VERSION, namespace, CM_PLURAL, body
         )
 
+    def patch_certificate(self, namespace: str, name: str, spec: dict) -> dict:
+        # Merge patch the managed spec fields into the existing Certificate so
+        # cert-manager reissues for the updated publication.
+        return self.custom.patch_namespaced_custom_object(
+            CM_GROUP, CM_VERSION, namespace, CM_PLURAL, name, {"spec": spec}
+        )
+
     def patch_publication_status(self, namespace: str, name: str, status: dict) -> None:
         # Merge patch against the /status subresource: omitted fields are
         # preserved, so callers only set what changed.

@@ -5,7 +5,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from cert_publisher.certmanager import build_certificate_body
+from cert_publisher.certmanager import (
+    build_certificate_body,
+    certificate_spec_drift,
+)
 from cert_publisher.status import PUBLISHED, set_status
 from cert_publisher.utils import leaf_pem, sha1_thumbprint, sha256_fingerprint
 
@@ -56,6 +59,64 @@ def test_build_certificate_body():
     assert body["spec"]["secretName"] == "web01-tls"
     assert body["spec"]["duration"] == "2160h"
     assert body["spec"]["dnsNames"] == ["web01.example.com"]
+
+
+def test_ssh_load_private_key_detects_type():
+    import paramiko
+
+    from cert_publisher.provisioners.ssh import _load_private_key
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    loaded = _load_private_key(pem, None)
+    assert isinstance(loaded, paramiko.RSAKey)
+
+
+def test_ssh_load_private_key_rejects_garbage():
+    import paramiko
+    import pytest
+
+    from cert_publisher.provisioners.ssh import _load_private_key
+
+    with pytest.raises(paramiko.SSHException):
+        _load_private_key("not a key", None)
+
+
+def test_certificate_spec_drift_detects_dns_change():
+    pub = {
+        "metadata": {"name": "web01", "namespace": "default", "uid": "abc-123"},
+        "spec": {
+            "dnsNames": ["web01.example.com"],
+            "issuerRef": {"name": "letsencrypt-prod", "kind": "ClusterIssuer"},
+        },
+    }
+    existing = build_certificate_body(pub, "web01-tls")
+    # Same spec: no drift.
+    assert certificate_spec_drift(existing, pub, "web01-tls") is None
+    # Changed subjects: drift returns the desired spec.
+    pub["spec"]["dnsNames"] = ["web01.example.com", "www.example.com"]
+    drift = certificate_spec_drift(existing, pub, "web01-tls")
+    assert drift is not None
+    assert drift["dnsNames"] == ["web01.example.com", "www.example.com"]
+
+
+def test_certificate_spec_drift_ignores_cert_manager_defaults():
+    pub = {
+        "metadata": {"name": "web01", "namespace": "default", "uid": "abc-123"},
+        "spec": {
+            "dnsNames": ["web01.example.com"],
+            "issuerRef": {"name": "letsencrypt-prod", "kind": "ClusterIssuer"},
+        },
+    }
+    existing = build_certificate_body(pub, "web01-tls")
+    # cert-manager adds fields we don't manage; these must not read as drift.
+    existing["spec"]["revisionHistoryLimit"] = 1
+    existing["spec"]["privateKey"] = {"algorithm": "RSA"}
+    assert certificate_spec_drift(existing, pub, "web01-tls") is None
 
 
 class _FakeKube:

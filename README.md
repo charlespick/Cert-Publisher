@@ -16,10 +16,12 @@ names, issuer) and where it should be installed (the provisioner). The
 controller runs as a Kubernetes `CronJob`. On each run it scans every
 `CertPublication` and, for each one:
 
-1. **Ensures a cert-manager `Certificate` exists.** If it's missing, the
-   controller creates one owned by the `CertPublication` and moves on — the
-   cert is published on a later run once it's been issued. From then on
-   cert-manager owns renewal and rotation (including when the subjects change).
+1. **Ensures a cert-manager `Certificate` exists and matches the spec.** If
+   it's missing, the controller creates one owned by the `CertPublication` and
+   moves on — the cert is published on a later run once it's been issued. If the
+   publication's subjects, issuer, or renewal settings later change, the
+   controller patches the owned `Certificate` so cert-manager reissues.
+   cert-manager owns renewal and rotation timing throughout.
 2. **Reads the issued certificate** from the Secret cert-manager populates.
 3. **Compares** the issued leaf against what's actually installed on the target
    host (by fingerprint).

@@ -58,6 +58,10 @@ class WinRMProvisioner(Provisioner):
 
     @classmethod
     def from_spec(cls, spec: dict, kube, namespace: str) -> "WinRMProvisioner":
+        mode = spec.get("mode", MODE_CERT_STORE)
+        cert_path = spec.get("certPath")
+        if mode == MODE_FILE and not cert_path:
+            raise ValueError("winrm file mode requires certPath")
         return cls(
             host=spec["host"],
             port=int(spec.get("port", 5986)),
@@ -65,10 +69,10 @@ class WinRMProvisioner(Provisioner):
             thumbprint=spec["thumbprint"],
             transport=spec.get("transport", "ntlm"),
             credentials=resolve_credentials(spec.get("auth", {}), kube, namespace),
-            mode=spec.get("mode", MODE_CERT_STORE),
+            mode=mode,
             store_location=spec.get("storeLocation", "LocalMachine"),
             store_name=spec.get("storeName", "My"),
-            cert_path=spec.get("certPath"),
+            cert_path=cert_path,
             key_path=spec.get("keyPath"),
             post_install_script=spec.get("postInstallScript"),
         )
@@ -120,7 +124,8 @@ class WinRMProvisioner(Provisioner):
             out = self._run_ps(session, f"Test-Path '{path}'")
             return out.strip().lower() == "true"
 
-        # file mode: compare the SHA-1 of the remote cert file
+        # file mode: compare the leaf thumbprint of the remote cert file, so
+        # PEM formatting or chain differences don't trigger spurious reinstalls.
         remote = self._run_ps(
             session,
             f"if (Test-Path '{self.cert_path}') "
@@ -128,9 +133,10 @@ class WinRMProvisioner(Provisioner):
         ).strip()
         if not remote:
             return False
-        return hashlib.sha1(base64.b64decode(remote)).hexdigest() == hashlib.sha1(
-            cert_pem
-        ).hexdigest()
+        try:
+            return sha1_thumbprint(base64.b64decode(remote)) == sha1_thumbprint(cert_pem)
+        except ValueError:
+            return False  # remote file isn't a parseable certificate
 
     def install(self, cert_pem: bytes, key_pem: bytes) -> None:
         self._verify_endpoint()
