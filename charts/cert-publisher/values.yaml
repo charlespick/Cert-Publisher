@@ -1,0 +1,76 @@
+# Default values for cert-publisher.
+
+image:
+  repository: ghcr.io/charlespick/cert-publisher
+  pullPolicy: IfNotPresent
+  # Overrides the image tag. Defaults to the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+crds:
+  # Install the CertPublication CRD as part of the release. Set to false if you
+  # manage the CRD separately (e.g. a shared cluster where another release owns
+  # it). When true the CRD is upgraded with the release.
+  install: true
+
+rbac:
+  # Create the ClusterRole and ClusterRoleBinding the controller needs to read
+  # CertPublications and Secrets cluster-wide and manage cert-manager
+  # Certificates.
+  create: true
+
+serviceAccount:
+  create: true
+  # Name of the service account to use. Generated from the fullname when empty.
+  name: ""
+  annotations: {}
+
+# Controller configuration, surfaced as environment variables on the job.
+config:
+  logLevel: INFO
+  # Leave empty to reconcile CertPublications across the whole cluster, or set a
+  # namespace to scope reconciliation to it.
+  watchNamespace: ""
+
+# Extra environment variables for the container.
+extraEnv: []
+
+cronjob:
+  # cert-manager decides when a cert is renewed; this job just picks up the new
+  # material and pushes it to targets on its next run.
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  # Optional suspend toggle for pausing reconciliation without uninstalling.
+  suspend: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

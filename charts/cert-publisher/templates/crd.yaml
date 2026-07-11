@@ -1,7 +1,13 @@
+{{- if .Values.crds.install -}}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: certpublications.certpublisher.makerland.xyz
+  labels:
+    {{- include "cert-publisher.labels" . | nindent 4 }}
+  annotations:
+    # Keep the CRD (and any CertPublications) when the release is uninstalled.
+    helm.sh/resource-policy: keep
 spec:
   group: certpublisher.makerland.xyz
   scope: Namespaced
@@ -183,3 +189,4 @@ spec:
                 observedGeneration:
                   type: integer
                   format: int64
+{{- end }}

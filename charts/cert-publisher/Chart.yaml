@@ -1,0 +1,21 @@
+apiVersion: v2
+name: cert-publisher
+description: >-
+  Publish cert-manager certificates to non-Kubernetes hosts over SSH and WinRM.
+type: application
+# version is the chart version and appVersion is the cert-publisher image
+# version. The release workflow overrides both from the git tag when publishing.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/charlespick/cert-publisher
+sources:
+  - https://github.com/charlespick/cert-publisher
+maintainers:
+  - name: Charles Pickering
+    email: me@charlespick.xyz
+keywords:
+  - cert-manager
+  - certificates
+  - ssh
+  - winrm
+  - operator
