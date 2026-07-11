@@ -1,0 +1,16 @@
+cert-publisher {{ .Chart.AppVersion }} is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+The controller runs as a CronJob ({{ .Values.cronjob.schedule }}). It requires
+cert-manager to already be installed in the cluster.
+
+{{- if .Values.config.watchNamespace }}
+Reconciliation is scoped to namespace: {{ .Values.config.watchNamespace }}
+{{- else }}
+Reconciliation covers CertPublications across the whole cluster.
+{{- end }}
+
+Create a CertPublication to start publishing certificates. See the examples at
+https://github.com/charlespick/cert-publisher/tree/main/examples
+
+Watch progress with:
+  kubectl get certpublications -A

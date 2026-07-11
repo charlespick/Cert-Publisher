@@ -83,15 +83,44 @@ See [`examples/`](examples/) for full manifests.
 
 ## Deploying
 
+Cert-Publisher ships as a Helm chart, published to GHCR as an OCI artifact.
+
 ```sh
 # Requires cert-manager already installed in the cluster.
-kubectl apply -k deploy/
+helm install cert-publisher \
+  oci://ghcr.io/charlespick/charts/cert-publisher \
+  --namespace cert-publisher --create-namespace
 ```
 
-This installs the CRD, a namespace, RBAC, and the CronJob (image
+This installs the CRD, RBAC, a ServiceAccount, and the CronJob (image
 `ghcr.io/charlespick/cert-publisher`). By default the controller reconciles
-`CertPublication`s across the whole cluster; set `WATCH_NAMESPACE` on the
-CronJob to scope it to one namespace.
+`CertPublication`s across the whole cluster; scope it to one namespace with
+`--set config.watchNamespace=<namespace>`.
+
+To install from a checkout of this repository instead:
+
+```sh
+helm install cert-publisher charts/cert-publisher \
+  --namespace cert-publisher --create-namespace
+```
+
+### Configuration
+
+Common values (see [`charts/cert-publisher/values.yaml`](charts/cert-publisher/values.yaml)
+for the full list):
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `image.repository` | `ghcr.io/charlespick/cert-publisher` | Controller image |
+| `image.tag` | chart `appVersion` | Controller image tag |
+| `config.logLevel` | `INFO` | Log level |
+| `config.watchNamespace` | `""` (whole cluster) | Namespace to scope reconciliation to |
+| `cronjob.schedule` | `*/30 * * * *` | Reconcile schedule |
+| `cronjob.suspend` | `false` | Pause reconciliation without uninstalling |
+| `crds.install` | `true` | Install the `CertPublication` CRD with the release |
+
+The CRD carries a `helm.sh/resource-policy: keep` annotation, so uninstalling
+the release leaves the CRD and any `CertPublication`s in place.
 
 ## Development
 
