@@ -244,7 +244,7 @@ try {{
         script = f"""
 $ErrorActionPreference = 'Stop'
 $b64file = '{b64file}'
-$hook = [IO.Path]::GetTempFileName() + '.ps1'
+$hook = [IO.Path]::Combine([IO.Path]::GetTempPath(), [IO.Path]::GetRandomFileName() + '.ps1')
 try {{
     $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
     [IO.File]::WriteAllBytes($hook, $bytes)
