@@ -119,6 +119,75 @@ def test_certificate_spec_drift_ignores_cert_manager_defaults():
     assert certificate_spec_drift(existing, pub, "web01-tls") is None
 
 
+class _FakeResult:
+    def __init__(self, std_out=b"", std_err=b"", status_code=0):
+        self.std_out = std_out
+        self.std_err = std_err
+        self.status_code = status_code
+
+
+class _FakeWinRMSession:
+    """Records every PowerShell script run so uploads can be asserted on."""
+
+    def __init__(self):
+        self.scripts = []
+
+    def run_ps(self, script):
+        self.scripts.append(script)
+        # GetTempFileName is used to allocate a remote scratch path.
+        if script.strip() == "[IO.Path]::GetTempFileName()":
+            return _FakeResult(std_out=b"C:\\Temp\\tmp123.tmp\r\n")
+        return _FakeResult()
+
+
+def _winrm_provisioner():
+    from cert_publisher.provisioners.base import Credentials
+    from cert_publisher.provisioners.winrm import WinRMProvisioner
+
+    return WinRMProvisioner(
+        host="win01.example.com", port=5986, username="Administrator",
+        thumbprint="AA:BB", transport="ntlm", credentials=Credentials(password="p"),
+        mode="file", store_location="LocalMachine", store_name="My",
+        cert_path="C:\\certs\\web.crt", key_path=None, post_install_script=None,
+    )
+
+
+def test_winrm_upload_chunks_stay_within_command_limit():
+    import base64
+
+    from cert_publisher.provisioners import winrm as winrm_mod
+
+    prov = _winrm_provisioner()
+    session = _FakeWinRMSession()
+    # Payload large enough to require several chunks.
+    data = b"x" * 20_000
+    remote = prov._upload_b64(session, data)
+    assert remote == "C:\\Temp\\tmp123.tmp"
+
+    b64 = base64.b64encode(data).decode()
+    writes = [s for s in session.scripts if "[IO.File]::" in s]
+    assert len(writes) > 1  # multiple chunks, not one giant command
+    assert "WriteAllText" in writes[0]
+    assert all("AppendAllText" in w for w in writes[1:])
+    # Every command line must stay well under the WinRM limit.
+    assert all(len(w) < winrm_mod._UPLOAD_CHUNK + 200 for w in writes)
+    # Concatenated chunks reconstruct the original base64 exactly.
+    joined = "".join(
+        w.split("'")[3] for w in writes  # the chunk literal is the 2nd '...'
+    )
+    assert joined == b64
+
+
+def test_winrm_write_file_uploads_via_temp_file():
+    prov = _winrm_provisioner()
+    session = _FakeWinRMSession()
+    prov._write_file(session, "C:\\certs\\web.crt", b"hello")
+    final = session.scripts[-1]
+    # Final command references the uploaded temp file, not an inlined blob.
+    assert "ReadAllText" in final
+    assert "C:\\certs\\web.crt" in final
+
+
 class _FakeKube:
     def __init__(self):
         self.patched = None

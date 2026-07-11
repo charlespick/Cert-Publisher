@@ -25,6 +25,14 @@ log = logging.getLogger("cert-publisher.winrm")
 MODE_CERT_STORE = "certStore"
 MODE_FILE = "file"
 
+# Maximum base64 characters embedded in a single WinRM command. pywinrm wraps
+# every ``run_ps`` script as ``powershell -EncodedCommand <utf16-base64>``,
+# which inflates the script ~2.7x, and WinRS rejects over-long command lines
+# ("line too long"). A multi-KB certificate cannot ride in one command, so we
+# stream the payload to the remote host in chunks this size; 2000 leaves ample
+# headroom for the surrounding PowerShell after encoding.
+_UPLOAD_CHUNK = 2000
+
 
 class WinRMProvisioner(Provisioner):
     def __init__(
@@ -113,6 +121,26 @@ class WinRMProvisioner(Provisioner):
             )
         return result.std_out.decode(errors="replace")
 
+    # -- chunked upload ---------------------------------------------------
+
+    def _upload_b64(self, session: winrm.Session, data: bytes) -> str:
+        """Stream ``data`` to a remote temp file as base64, in WinRM-safe chunks.
+
+        Returns the path of the remote file holding the base64 text; callers
+        decode it on the far side. Splitting the payload across many small
+        commands keeps every WinRM command line well under the length limit that
+        a single inlined certificate would otherwise exceed. The base64 alphabet
+        contains no single quotes, so each chunk embeds safely in a PowerShell
+        literal.
+        """
+        b64 = base64.b64encode(data).decode()
+        remote = self._run_ps(session, "[IO.Path]::GetTempFileName()").strip()
+        for start in range(0, len(b64), _UPLOAD_CHUNK):
+            chunk = b64[start : start + _UPLOAD_CHUNK]
+            writer = "WriteAllText" if start == 0 else "AppendAllText"
+            self._run_ps(session, f"[IO.File]::{writer}('{remote}', '{chunk}')")
+        return remote
+
     # -- provisioner interface -------------------------------------------
 
     def is_current(self, cert_pem: bytes) -> bool:
@@ -150,7 +178,7 @@ class WinRMProvisioner(Provisioner):
 
         if self.post_install_script:
             log.info("[%s] running post-install script", self.host)
-            self._run_ps(session, self.post_install_script)
+            self._run_post_install(session)
 
     def _install_cert_store(
         self, session: winrm.Session, cert_pem: bytes, key_pem: bytes
@@ -165,18 +193,20 @@ class WinRMProvisioner(Provisioner):
             cas=certs[1:] or None,
             encryption_algorithm=BestAvailableEncryption(pfx_password.encode()),
         )
-        b64 = base64.b64encode(pfx).decode()
+        b64file = self._upload_b64(session, pfx)
         script = f"""
 $ErrorActionPreference = 'Stop'
-$bytes = [Convert]::FromBase64String('{b64}')
+$b64file = '{b64file}'
 $tmp = [IO.Path]::GetTempFileName()
-[IO.File]::WriteAllBytes($tmp, $bytes)
 try {{
+    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
+    [IO.File]::WriteAllBytes($tmp, $bytes)
     $pw = ConvertTo-SecureString '{pfx_password}' -AsPlainText -Force
     $store = 'Cert:\\{self.store_location}\\{self.store_name}'
     Import-PfxCertificate -FilePath $tmp -CertStoreLocation $store -Password $pw | Out-Null
 }} finally {{
-    Remove-Item $tmp -Force
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
 }}
 """
         self._run_ps(session, script)
@@ -189,8 +219,40 @@ try {{
             self._write_file(session, self.key_path, key_pem)
 
     def _write_file(self, session: winrm.Session, path: str, data: bytes) -> None:
-        b64 = base64.b64encode(data).decode()
-        self._run_ps(
-            session,
-            f"[IO.File]::WriteAllBytes('{path}', [Convert]::FromBase64String('{b64}'))",
-        )
+        b64file = self._upload_b64(session, data)
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$b64file = '{b64file}'
+try {{
+    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
+    [IO.File]::WriteAllBytes('{path}', $bytes)
+}} finally {{
+    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
+}}
+"""
+        self._run_ps(session, script)
+
+    def _run_post_install(self, session: winrm.Session) -> None:
+        """Upload the post-install hook and run it by path, never inlined.
+
+        Operator-supplied scripts can be arbitrarily long, so we stream the
+        script to a remote ``.ps1`` file (chunked, like certificate uploads) and
+        dot-source it rather than embedding it in a single command. Base64 also
+        sidesteps any quoting hazards in the script text itself.
+        """
+        b64file = self._upload_b64(session, self.post_install_script.encode("utf-8"))
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$b64file = '{b64file}'
+$hook = [IO.Path]::GetTempFileName() + '.ps1'
+try {{
+    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
+    [IO.File]::WriteAllBytes($hook, $bytes)
+    & $hook
+    if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}} finally {{
+    Remove-Item $hook -Force -ErrorAction SilentlyContinue
+    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
+}}
+"""
+        self._run_ps(session, script)
