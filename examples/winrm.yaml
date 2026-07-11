@@ -1,0 +1,39 @@
+# Import a certificate into the Windows LocalMachine\My store over WinRM.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: win01-creds
+  namespace: default
+type: Opaque
+stringData:
+  password: "replace-me"
+---
+apiVersion: certpublisher.makerland.xyz/v1alpha1
+kind: CertPublication
+metadata:
+  name: win01
+  namespace: default
+spec:
+  dnsNames:
+    - win01.example.com
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  provisioner:
+    type: winrm
+    winrm:
+      host: win01.example.com
+      port: 5986
+      username: Administrator
+      thumbprint: "REPLACE_WITH_LISTENER_SHA1_THUMBPRINT"
+      transport: ntlm
+      auth:
+        secretRef:
+          name: win01-creds
+      mode: certStore
+      storeLocation: LocalMachine
+      storeName: My
+      # Optional: bind the freshly imported cert to a service, e.g. rebind IIS.
+      # postInstallScript: |
+      #   Import-Module WebAdministration
+      #   ...

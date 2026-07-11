@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-publisher
+  namespace: cert-publisher
+---
+# Cluster-wide read of CertPublications and Secrets, plus management of the
+# cert-manager Certificates this operator creates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-publisher
+rules:
+  - apiGroups: ["certpublisher.makerland.xyz"]
+    resources: ["certpublications"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["certpublisher.makerland.xyz"]
+    resources: ["certpublications/status"]
+    verbs: ["get", "update", "patch"]
+  # Required to set blockOwnerDeletion on owned Certificates in clusters that
+  # enable OwnerReferencesPermissionEnforcement.
+  - apiGroups: ["certpublisher.makerland.xyz"]
+    resources: ["certpublications/finalizers"]
+    verbs: ["update"]
+  # Certificates are looked up by name, created, and patched when the
+  # publication spec changes; the operator never lists or watches them.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "create", "update", "patch"]
+  # Secrets (issued material and auth) are only ever read by name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-publisher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-publisher
+subjects:
+  - kind: ServiceAccount
+    name: cert-publisher
+    namespace: cert-publisher

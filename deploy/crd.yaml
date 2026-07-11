@@ -1,0 +1,185 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: certpublications.certpublisher.makerland.xyz
+spec:
+  group: certpublisher.makerland.xyz
+  scope: Namespaced
+  names:
+    kind: CertPublication
+    plural: certpublications
+    singular: certpublication
+    shortNames:
+      - certpub
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: DNS
+          type: string
+          jsonPath: .spec.dnsNames[0]
+        - name: Provisioner
+          type: string
+          jsonPath: .spec.provisioner.type
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Published
+          type: date
+          jsonPath: .status.lastPublishedTime
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [dnsNames, issuerRef, provisioner]
+              properties:
+                dnsNames:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                commonName:
+                  type: string
+                secretName:
+                  type: string
+                  description: >-
+                    Secret cert-manager stores the issued certificate in.
+                    Defaults to "<name>-tls".
+                duration:
+                  type: string
+                renewBefore:
+                  type: string
+                usages:
+                  type: array
+                  items:
+                    type: string
+                issuerRef:
+                  type: object
+                  required: [name, kind]
+                  properties:
+                    name:
+                      type: string
+                    kind:
+                      type: string
+                      enum: [Issuer, ClusterIssuer]
+                    group:
+                      type: string
+                provisioner:
+                  type: object
+                  required: [type]
+                  properties:
+                    type:
+                      type: string
+                      enum: [ssh, winrm]
+                    ssh:
+                      type: object
+                      required: [host, username, hostFingerprint, auth, certPath, keyPath]
+                      properties:
+                        host:
+                          type: string
+                        port:
+                          type: integer
+                          default: 22
+                        username:
+                          type: string
+                        hostFingerprint:
+                          type: string
+                          description: OpenSSH SHA256 host key fingerprint, e.g. "SHA256:...".
+                        auth:
+                          type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies password and/or
+                            privateKey (+ optional passphrase).
+                          properties:
+                            secretRef:
+                              type: object
+                              required: [name]
+                              properties:
+                                name:
+                                  type: string
+                        certPath:
+                          type: string
+                        keyPath:
+                          type: string
+                        fileMode:
+                          type: string
+                          default: "0644"
+                        keyFileMode:
+                          type: string
+                          default: "0600"
+                        postInstallScript:
+                          type: string
+                    winrm:
+                      type: object
+                      required: [host, username, thumbprint, auth]
+                      properties:
+                        host:
+                          type: string
+                        port:
+                          type: integer
+                          default: 5986
+                        username:
+                          type: string
+                        thumbprint:
+                          type: string
+                          description: SHA1 thumbprint of the WinRM HTTPS listener certificate.
+                        transport:
+                          type: string
+                          default: ntlm
+                        auth:
+                          type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies the password.
+                          properties:
+                            secretRef:
+                              type: object
+                              required: [name]
+                              properties:
+                                name:
+                                  type: string
+                        mode:
+                          type: string
+                          enum: [certStore, file]
+                          default: certStore
+                        storeLocation:
+                          type: string
+                          default: LocalMachine
+                        storeName:
+                          type: string
+                          default: My
+                        certPath:
+                          type: string
+                        keyPath:
+                          type: string
+                        postInstallScript:
+                          type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Pending, Published, or Error.
+                message:
+                  type: string
+                publishedFingerprint:
+                  type: string
+                  description: SHA-256 fingerprint of the leaf last confirmed on the target.
+                lastPublishedTime:
+                  type: string
+                  format: date-time
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+                observedGeneration:
+                  type: integer
+                  format: int64
