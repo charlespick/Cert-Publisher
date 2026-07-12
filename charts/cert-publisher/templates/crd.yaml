@@ -82,7 +82,7 @@ spec:
                   properties:
                     type:
                       type: string
-                      enum: [ssh, winrm]
+                      enum: [ssh, winrm, dellidrac8]
                     ssh:
                       type: object
                       required: [host, username, hostFingerprint, auth, certPath, keyPath]
@@ -169,6 +169,60 @@ spec:
                           type: string
                         postInstallScript:
                           type: string
+                    dellidrac8:
+                      type: object
+                      required: [host, username, auth]
+                      description: >-
+                        Install the iDRAC HTTPS certificate on a Dell 12th/13th
+                        gen PowerEdge iDRAC8 via its OEM Redfish API. The iDRAC
+                        reboots to apply the new certificate.
+                      properties:
+                        host:
+                          type: string
+                          description: >-
+                            iDRAC hostname or IP. Use the name present in the
+                            certificate so the "currently valid" host check can
+                            match it across renewals.
+                        port:
+                          type: integer
+                          default: 443
+                        username:
+                          type: string
+                        auth:
+                          type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies the password.
+                          properties:
+                            secretRef:
+                              type: object
+                              required: [name]
+                              properties:
+                                name:
+                                  type: string
+                        bootstrapThumbprint:
+                          type: string
+                          description: >-
+                            SHA-256 thumbprint of the iDRAC HTTPS endpoint
+                            certificate, used to verify host identity before a
+                            trusted certificate is installed (e.g. the factory
+                            self-signed cert). Once a valid cert is in place,
+                            verification succeeds via normal PKI and renewals
+                            keep working even as the thumbprint changes.
+                        caBundle:
+                          type: string
+                          description: >-
+                            Optional PEM CA bundle used to judge whether the live
+                            endpoint certificate is currently valid. Defaults to
+                            the system trust store plus the issuing chain of the
+                            certificate being published.
+                        reboot:
+                          type: boolean
+                          default: true
+                          description: >-
+                            Reboot the iDRAC after import to apply the new
+                            certificate. iDRAC8 requires this; leave enabled.
             status:
               type: object
               properties:

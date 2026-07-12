@@ -71,13 +71,32 @@ authenticates over the configured transport (NTLM by default), and either:
 
 Both modes support an optional post-install PowerShell script.
 
+### Dell iDRAC8 (Redfish)
+
+Installs the iDRAC HTTPS certificate on a Dell 12th/13th-gen PowerEdge iDRAC8
+through its OEM Redfish API. cert-manager's leaf and key are packaged into a
+PKCS#12 bundle and imported via `DelliDRACCardService.ImportSSLCertificate`
+(`CustomCertificate`), then the iDRAC is rebooted with `Manager.Reset`, which
+iDRAC8 requires before a new certificate takes effect.
+
+Host identity is verified before anything is sent, by **either** of two signals,
+so a host transitions seamlessly from first setup to ongoing renewals:
+
+- **`bootstrapThumbprint`** — a SHA-256 thumbprint of the endpoint certificate,
+  used on the first run when only the factory self-signed cert exists; or
+- **currently valid** — the live HTTPS certificate chains to a trusted CA
+  (system trust, an optional `caBundle`, or the published cert's own chain),
+  matches the hostname, and is unexpired. Once a real cert is installed this
+  keeps working across renewals even as the thumbprint changes, so renewals in
+  time "just work".
+
 ### Credentials
 
 No secret material is ever stored in a `CertPublication`. Every provisioner's
 `auth.secretRef` points at a `Secret` **in the same namespace** as the
-publication, which supplies the SSH password/private key (+ optional
-passphrase) or the WinRM password. Host-identity values (`hostFingerprint`,
-`thumbprint`) are public verification data, not secrets, and stay in the spec.
+passphrase), the WinRM password, or the iDRAC password. Host-identity values
+(`hostFingerprint`, `thumbprint`, `bootstrapThumbprint`, `caBundle`) are public
+verification data, not secrets, and stay in the spec.
 
 See [`examples/`](examples/) for full manifests.
 
@@ -138,7 +157,7 @@ The package lives in `src/cert_publisher/`:
 | `reconcile.py` | Per-publication reconcile logic |
 | `certmanager.py` | Builds the owned cert-manager `Certificate` |
 | `kube.py` | Kubernetes API access |
-| `provisioners/` | `ssh` and `winrm` install backends |
+| `provisioners/` | `ssh`, `winrm`, and `dellidrac8` install backends |
 | `utils.py` | Certificate parsing / fingerprints |
 
 ## License

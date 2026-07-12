@@ -1,0 +1,45 @@
+# Install the iDRAC HTTPS certificate on a Dell 12th/13th gen PowerEdge
+# (iDRAC8) via its OEM Redfish API. The iDRAC reboots to apply the new cert.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: idrac01-creds
+  namespace: default
+type: Opaque
+stringData:
+  password: "replace-me"
+---
+apiVersion: certpublisher.makerland.xyz/v1alpha1
+kind: CertPublication
+metadata:
+  name: idrac01
+  namespace: default
+spec:
+  dnsNames:
+    - idrac01.example.com
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  provisioner:
+    type: dellidrac8
+    dellidrac8:
+      # Use the DNS name in the certificate so, after the first install, the
+      # "currently valid" host check keeps matching across future renewals.
+      host: idrac01.example.com
+      port: 443
+      username: root
+      auth:
+        secretRef:
+          name: idrac01-creds
+      # Bootstrap trust for the first run (before a trusted cert is installed),
+      # e.g. the iDRAC's factory self-signed cert. Get it with:
+      #   openssl s_client -connect idrac01.example.com:443 </dev/null 2>/dev/null \
+      #     | openssl x509 -noout -fingerprint -sha256
+      bootstrapThumbprint: "REPLACE_WITH_ENDPOINT_SHA256_THUMBPRINT"
+      # Optional: PEM CA bundle to validate the live endpoint cert against.
+      # Defaults to the system trust store plus the published cert's own chain.
+      # caBundle: |
+      #   -----BEGIN CERTIFICATE-----
+      #   ...internal CA...
+      #   -----END CERTIFICATE-----
+      reboot: true
