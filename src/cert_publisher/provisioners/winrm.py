@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.serialization import (
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509 import load_pem_x509_certificates
 
+from ..retry import with_retries
 from ..utils import sha1_thumbprint
 from .base import Credentials, Provisioner, resolve_credentials
 
@@ -88,19 +89,33 @@ class WinRMProvisioner(Provisioner):
     # -- host verification ------------------------------------------------
 
     def _verify_endpoint(self) -> None:
-        """Pin the WinRM HTTPS listener to the configured SHA-1 thumbprint."""
+        """Pin the WinRM HTTPS listener to the configured SHA-1 thumbprint.
+
+        Establishing the TLS connection is retried with backoff: a briefly
+        unreachable or slow-to-answer host is a transient condition and
+        shouldn't fail the whole reconcile on the first timeout.
+        """
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((self.host, self.port), timeout=15) as sock:
-            with ctx.wrap_socket(sock, server_hostname=self.host) as tls:
-                der = tls.getpeercert(binary_form=True)
+
+        def _peer_cert() -> bytes:
+            log.debug("connecting to WinRM endpoint %s:%d", self.host, self.port)
+            with socket.create_connection((self.host, self.port), timeout=15) as sock:
+                with ctx.wrap_socket(sock, server_hostname=self.host) as tls:
+                    return tls.getpeercert(binary_form=True)
+
+        der = with_retries(
+            _peer_cert,
+            description=f"WinRM endpoint check for {self.host}:{self.port}",
+        )
         got = hashlib.sha1(der).hexdigest().upper()
         if got != self.thumbprint:
             raise RuntimeError(
                 f"WinRM endpoint thumbprint mismatch for {self.host}: "
                 f"expected {self.thumbprint}, got {got}"
             )
+        log.debug("WinRM endpoint %s:%d thumbprint verified", self.host, self.port)
 
     def _session(self) -> winrm.Session:
         if not self.credentials.password:

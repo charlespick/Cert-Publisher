@@ -10,6 +10,7 @@ import stat
 
 import paramiko
 
+from ..retry import with_retries
 from ..utils import sha256_fingerprint
 from .base import Credentials, Provisioner, resolve_credentials
 
@@ -119,7 +120,18 @@ class SSHProvisioner(Provisioner):
         else:
             raise ValueError("ssh provisioner requires a password or privateKey")
 
-        c.connect(**kwargs)
+        def _do_connect() -> None:
+            # Retry the connect only. Auth failures and host-key mismatches raise
+            # paramiko.SSHException (not OSError), so they propagate immediately
+            # instead of being pointlessly retried; only network-level timeouts
+            # and refused/unreachable conditions are transient and retried.
+            log.debug("connecting to SSH host %s:%d", self.host, self.port)
+            c.connect(**kwargs)
+
+        with_retries(
+            _do_connect,
+            description=f"SSH connection to {self.host}:{self.port}",
+        )
         return c
 
     def is_current(self, cert_pem: bytes) -> bool:
