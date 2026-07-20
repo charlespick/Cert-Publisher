@@ -1,9 +1,13 @@
 import base64
 import datetime
 import json
+import ssl
 
 import pytest
+import requests
 from cryptography import x509
+
+import cert_publisher.provisioners.dellidrac8 as dm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
@@ -269,3 +273,67 @@ def test_message_id_extracted_from_extended_info():
         200, body={"@Message.ExtendedInfo": [{"MessageId": "Base.1.5.Success"}]}
     )
     assert DelliDRAC8Provisioner._message_id(resp) == "Base.1.5.Success"
+
+
+# -- retry integration --------------------------------------------------
+
+
+def test_endpoint_valid_returns_false_on_cert_verification_error(monkeypatch):
+    # A reachable host serving an untrusted/invalid cert is a definitive "no":
+    # it returns False (falling back to bootstrap) without consuming retries.
+    calls = []
+
+    def _raise(*args, **kwargs):
+        calls.append(1)
+        raise ssl.SSLCertVerificationError("self-signed certificate")
+
+    monkeypatch.setattr(dm.socket, "create_connection", _raise)
+    prov = _provisioner()
+    assert prov._endpoint_currently_valid(None) is False
+    assert len(calls) == 1  # not retried
+
+
+def test_endpoint_valid_retries_transient_then_raises(monkeypatch):
+    # A host that stays unreachable is retried, then surfaces a clear
+    # ConnectionError rather than a misleading "not trusted".
+    monkeypatch.setenv("RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("RETRY_BASE_DELAY", "0")
+    calls = []
+
+    def _timeout(*args, **kwargs):
+        calls.append(1)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(dm.socket, "create_connection", _timeout)
+    prov = _provisioner()
+    with pytest.raises(ConnectionError, match="validity check"):
+        prov._endpoint_currently_valid(None)
+    assert len(calls) == 3  # exhausted all attempts
+
+
+def test_open_session_retries_transient_connection(monkeypatch):
+    monkeypatch.setenv("RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("RETRY_BASE_DELAY", "0")
+
+    class _FlakySession:
+        def __init__(self):
+            self.headers = {}
+            self.verify = None
+            self.auth = None
+            self.posts = 0
+
+        def post(self, url, json=None, timeout=None):
+            self.posts += 1
+            if self.posts == 1:
+                raise requests.exceptions.ConnectionError("connection refused")
+            return _FakeResponse(201, headers={"X-Auth-Token": "tok", "Location": "/s/1"})
+
+    flaky = _FlakySession()
+    monkeypatch.setattr(dm.requests, "Session", lambda: flaky)
+    prov = _provisioner()
+
+    session, location = prov._open_session()
+    assert session is flaky
+    assert flaky.posts == 2  # one transient failure, then success
+    assert flaky.headers["X-Auth-Token"] == "tok"
+    assert location == "/s/1"

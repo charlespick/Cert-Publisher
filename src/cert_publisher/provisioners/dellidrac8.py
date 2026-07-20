@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from cryptography.x509 import load_pem_x509_certificates
 
+from ..retry import with_retries
 from ..utils import sha256_fingerprint
 from .base import Credentials, Provisioner, resolve_credentials
 
@@ -106,15 +107,27 @@ class DelliDRAC8Provisioner(Provisioner):
     # -- host verification ------------------------------------------------
 
     def _peer_der(self) -> bytes:
-        """Return the endpoint leaf certificate (DER) without validating it."""
+        """Return the endpoint leaf certificate (DER) without validating it.
+
+        Establishing the TLS connection is retried with backoff: a briefly
+        unreachable or slow-to-answer host is transient and shouldn't fail the
+        whole reconcile on the first timeout.
+        """
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection(
-            (self.host, self.port), timeout=_CONNECT_TIMEOUT
-        ) as sock:
-            with ctx.wrap_socket(sock, server_hostname=self.host) as tls:
-                return tls.getpeercert(binary_form=True)
+
+        def _fetch() -> bytes:
+            log.debug("connecting to iDRAC endpoint %s:%d", self.host, self.port)
+            with socket.create_connection(
+                (self.host, self.port), timeout=_CONNECT_TIMEOUT
+            ) as sock:
+                with ctx.wrap_socket(sock, server_hostname=self.host) as tls:
+                    return tls.getpeercert(binary_form=True)
+
+        return with_retries(
+            _fetch, description=f"iDRAC endpoint check for {self.host}:{self.port}"
+        )
 
     def _endpoint_currently_valid(self, trust_pem: bytes | None) -> bool:
         """Whether the live HTTPS cert validates against trusted CAs and hostname.
@@ -136,14 +149,29 @@ class DelliDRAC8Provisioner(Provisioner):
                 ctx.load_verify_locations(cadata=trust_pem.decode())
             except (ssl.SSLError, ValueError, UnicodeDecodeError):
                 pass
-        try:
-            with socket.create_connection(
-                (self.host, self.port), timeout=_CONNECT_TIMEOUT
-            ) as sock:
-                with ctx.wrap_socket(sock, server_hostname=self.host):
-                    return True
-        except (ssl.SSLError, ssl.CertificateError, OSError):
-            return False
+
+        def _handshake() -> bool:
+            log.debug("validating iDRAC endpoint cert %s:%d", self.host, self.port)
+            try:
+                with socket.create_connection(
+                    (self.host, self.port), timeout=_CONNECT_TIMEOUT
+                ) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=self.host):
+                        return True
+            except ssl.SSLCertVerificationError:
+                # Reachable, but the served cert is not currently trusted/valid
+                # (untrusted CA, hostname mismatch, or expired). This is a
+                # definitive "no", not a transient failure -- so we fall back to
+                # the bootstrap thumbprint rather than retrying.
+                return False
+
+        # Only the connection is retried; a genuine verification failure returns
+        # False above without consuming retries. A host that stays unreachable
+        # raises a clear ConnectionError instead of a misleading "not trusted".
+        return with_retries(
+            _handshake,
+            description=f"iDRAC endpoint validity check for {self.host}:{self.port}",
+        )
 
     def _verify_endpoint(self, trust_pem: bytes | None = None) -> None:
         """Authenticate the iDRAC before sending credentials or key material.
@@ -180,10 +208,24 @@ class DelliDRAC8Provisioner(Provisioner):
         s = requests.Session()
         s.verify = False  # endpoint identity is checked out of band above
         s.headers["Content-Type"] = "application/json"
-        resp = s.post(
-            f"{self._base_url}{_SESSIONS}",
-            json={"UserName": self.username, "Password": self.credentials.password},
-            timeout=_TIMEOUT,
+
+        def _create() -> requests.Response:
+            # Retry only opening the session: a transient network error here is a
+            # requests.RequestException (an OSError subclass) and is retried,
+            # while an HTTP status is returned normally and handled below. The
+            # mutating import/reset calls are deliberately not retried.
+            log.debug("opening Redfish session to %s", self._base_url)
+            return s.post(
+                f"{self._base_url}{_SESSIONS}",
+                json={
+                    "UserName": self.username,
+                    "Password": self.credentials.password,
+                },
+                timeout=_TIMEOUT,
+            )
+
+        resp = with_retries(
+            _create, description=f"iDRAC Redfish session to {self.host}:{self.port}"
         )
         token = resp.headers.get("X-Auth-Token")
         if resp.status_code in (200, 201) and token:
