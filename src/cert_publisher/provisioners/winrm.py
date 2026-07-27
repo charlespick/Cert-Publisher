@@ -13,8 +13,8 @@ import winrm
 from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption,
     load_pem_private_key,
+    pkcs12,
 )
-from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509 import load_pem_x509_certificates
 
 from ..retry import with_retries
@@ -66,7 +66,7 @@ class WinRMProvisioner(Provisioner):
         self.post_install_script = post_install_script
 
     @classmethod
-    def from_spec(cls, spec: dict, kube, namespace: str) -> "WinRMProvisioner":
+    def from_spec(cls, spec: dict, kube, namespace: str) -> WinRMProvisioner:
         mode = spec.get("mode", MODE_CERT_STORE)
         cert_path = spec.get("certPath")
         if mode == MODE_FILE and not cert_path:
@@ -101,9 +101,11 @@ class WinRMProvisioner(Provisioner):
 
         def _peer_cert() -> bytes:
             log.debug("connecting to WinRM endpoint %s:%d", self.host, self.port)
-            with socket.create_connection((self.host, self.port), timeout=15) as sock:
-                with ctx.wrap_socket(sock, server_hostname=self.host) as tls:
-                    return tls.getpeercert(binary_form=True)
+            with (
+                socket.create_connection((self.host, self.port), timeout=15) as sock,
+                ctx.wrap_socket(sock, server_hostname=self.host) as tls,
+            ):
+                return tls.getpeercert(binary_form=True)
 
         der = with_retries(
             _peer_cert,

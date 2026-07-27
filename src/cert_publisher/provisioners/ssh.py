@@ -86,7 +86,7 @@ class SSHProvisioner(Provisioner):
         self.post_install_script = post_install_script
 
     @classmethod
-    def from_spec(cls, spec: dict, kube, namespace: str) -> "SSHProvisioner":
+    def from_spec(cls, spec: dict, kube, namespace: str) -> SSHProvisioner:
         return cls(
             host=spec["host"],
             port=int(spec.get("port", 22)),
@@ -142,7 +142,7 @@ class SSHProvisioner(Provisioner):
             try:
                 with sftp.open(self.cert_path, "rb") as fh:
                     existing = fh.read()
-            except IOError:
+            except OSError:
                 return False  # not installed yet
             finally:
                 sftp.close()
