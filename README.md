@@ -69,7 +69,12 @@ authenticates over the configured transport (NTLM by default), and either:
   (`LocalMachine\My` by default), or
 - **`file`** — writes the cert (and key) to a path.
 
-Both modes support an optional post-install PowerShell script.
+Both modes support an optional post-install PowerShell script. The script
+runs with `$env:CERT_PUBLISHER_THUMBPRINT` set to the newly installed certificate's
+SHA-1 thumbprint (40 uppercase hex characters, no colons or spaces — the
+literal form Windows and most .NET tooling expect). It runs under Windows
+PowerShell 5.1 by default; set `powershell: "7"` to run it with PowerShell 7
+(`pwsh.exe`) instead, which must already be installed on the target host.
 
 `certStore` mode also supports `exportablePrivateKey`, which marks the
 imported private key exportable. Windows fixes a private key's exportability

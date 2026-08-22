@@ -39,6 +39,12 @@ spec:
       # Windows can't change an already-imported key's exportability.
       # exportablePrivateKey: true
       # Optional: bind the freshly imported cert to a service, e.g. rebind IIS.
+      # The hook can read $env:CERT_PUBLISHER_THUMBPRINT for the newly installed
+      # certificate's SHA-1 thumbprint (40 uppercase hex chars, no colons).
       # postInstallScript: |
       #   Import-Module WebAdministration
       #   ...
+      # Optional: run postInstallScript with PowerShell 7 (pwsh.exe) instead
+      # of the default Windows PowerShell 5.1. PowerShell 7 must already be
+      # installed on the target host.
+      # powershell: "7"
