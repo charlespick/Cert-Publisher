@@ -33,6 +33,11 @@ spec:
       mode: certStore
       storeLocation: LocalMachine
       storeName: My
+      # Optional: mark the private key exportable (e.g. so it can be backed
+      # up or re-exported later). Changing this on an existing publication
+      # only takes effect the next time the certificate is renewed, since
+      # Windows can't change an already-imported key's exportability.
+      # exportablePrivateKey: true
       # Optional: bind the freshly imported cert to a service, e.g. rebind IIS.
       # postInstallScript: |
       #   Import-Module WebAdministration

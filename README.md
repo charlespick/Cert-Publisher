@@ -71,6 +71,15 @@ authenticates over the configured transport (NTLM by default), and either:
 
 Both modes support an optional post-install PowerShell script.
 
+`certStore` mode also supports `exportablePrivateKey`, which marks the
+imported private key exportable. Windows fixes a private key's exportability
+at import time — there's no supported way to flip it on an already-imported
+certificate short of deleting and reimporting it, which cert-publisher won't
+do on your behalf since that's a destructive operation cert-manager didn't
+ask for. So enabling `exportablePrivateKey` on a publication that's already
+published takes effect the next time the certificate is renewed; until then
+the reconcile is a no-op and the status message says the setting is pending.
+
 ### Credentials
 
 No secret material is ever stored in a `CertPublication`. Every provisioner's

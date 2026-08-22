@@ -57,8 +57,13 @@ def reconcile_publication(kube: Kube, pub: dict) -> None:
     prov = build_provisioner(spec["provisioner"], kube, namespace)
     if prov.is_current(cert_pem):
         log.info("[%s] installed certificate is up to date (%s)", ref, desired[:16])
+        message = "Certificate up to date"
+        warning = getattr(prov, "pending_warning", None)
+        if warning:
+            log.warning("[%s] %s", ref, warning)
+            message = f"{message}, but {warning}"
         set_status(
-            kube, pub, PUBLISHED, "Certificate up to date",
+            kube, pub, PUBLISHED, message,
             published_fingerprint=desired,
         )
         return

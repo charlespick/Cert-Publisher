@@ -51,6 +51,7 @@ class WinRMProvisioner(Provisioner):
         cert_path: str | None,
         key_path: str | None,
         post_install_script: str | None,
+        exportable_private_key: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -64,6 +65,12 @@ class WinRMProvisioner(Provisioner):
         self.cert_path = cert_path
         self.key_path = key_path
         self.post_install_script = post_install_script
+        self.exportable_private_key = exportable_private_key
+        # Set by is_current() when it detects the installed private key's
+        # exportability doesn't match the desired setting; reconcile.py folds
+        # this into the status message. See _install_cert_store for why this
+        # can't just be fixed in place.
+        self.pending_warning: str | None = None
 
     @classmethod
     def from_spec(cls, spec: dict, kube, namespace: str) -> WinRMProvisioner:
@@ -84,6 +91,7 @@ class WinRMProvisioner(Provisioner):
             cert_path=cert_path,
             key_path=spec.get("keyPath"),
             post_install_script=spec.get("postInstallScript"),
+            exportable_private_key=bool(spec.get("exportablePrivateKey", False)),
         )
 
     # -- host verification ------------------------------------------------
@@ -161,13 +169,18 @@ class WinRMProvisioner(Provisioner):
     # -- provisioner interface -------------------------------------------
 
     def is_current(self, cert_pem: bytes) -> bool:
+        self.pending_warning = None
         self._verify_endpoint()
         session = self._session()
         if self.mode == MODE_CERT_STORE:
             thumb = sha1_thumbprint(cert_pem)
             path = f"Cert:\\{self.store_location}\\{self.store_name}\\{thumb}"
-            out = self._run_ps(session, f"Test-Path '{path}'")
-            return out.strip().lower() == "true"
+            out = self._run_ps(session, self._cert_store_probe_script(path)).strip()
+            if not out.startswith("present"):
+                return False
+            if out != "present:nokey":
+                self._check_exportable_drift(out)
+            return True
 
         # file mode: compare the leaf thumbprint of the remote cert file, so
         # PEM formatting or chain differences don't trigger spurious reinstalls.
@@ -182,6 +195,52 @@ class WinRMProvisioner(Provisioner):
             return sha1_thumbprint(base64.b64decode(remote)) == sha1_thumbprint(cert_pem)
         except ValueError:
             return False  # remote file isn't a parseable certificate
+
+    @staticmethod
+    def _cert_store_probe_script(path: str) -> str:
+        """Report whether ``path`` exists and, if so, whether its private key
+        is exportable.
+
+        Exportability can't be read reliably via ``CspKeyContainerInfo`` (it
+        throws for CNG-backed keys, which is what modern Windows uses by
+        default), so this probes the only way that works across both CAPI and
+        CNG: attempt an in-memory PKCS#12 export and see if it's refused. The
+        exported bytes never leave the remote process or touch disk.
+        """
+        return f"""
+$c = Get-Item '{path}' -ErrorAction SilentlyContinue
+if (-not $c) {{
+    'absent'
+}} elseif (-not $c.HasPrivateKey) {{
+    'present:nokey'
+}} else {{
+    $exportable = $false
+    try {{
+        [void]$c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, 'cert-publisher-probe')
+        $exportable = $true
+    }} catch {{}}
+    if ($exportable) {{ 'present:exportable' }} else {{ 'present:sealed' }}
+}}
+"""
+
+    def _check_exportable_drift(self, probe_result: str) -> None:
+        actual_exportable = probe_result == "present:exportable"
+        if actual_exportable == self.exportable_private_key:
+            return
+        if self.exportable_private_key:
+            self.pending_warning = (
+                "exportablePrivateKey is enabled but the installed certificate's "
+                "private key was imported as non-exportable; Windows doesn't "
+                "support changing that in place, so this will take effect the "
+                "next time the certificate is renewed"
+            )
+        else:
+            self.pending_warning = (
+                "exportablePrivateKey is disabled but the installed certificate's "
+                "private key was imported as exportable; Windows doesn't support "
+                "changing that in place, so this will take effect the next time "
+                "the certificate is renewed"
+            )
 
     def install(self, cert_pem: bytes, key_pem: bytes) -> None:
         self._verify_endpoint()
@@ -211,6 +270,7 @@ class WinRMProvisioner(Provisioner):
             encryption_algorithm=BestAvailableEncryption(pfx_password.encode()),
         )
         b64file = self._upload_b64(session, pfx)
+        exportable_arg = " -Exportable" if self.exportable_private_key else ""
         script = f"""
 $ErrorActionPreference = 'Stop'
 $b64file = '{b64file}'
@@ -220,7 +280,7 @@ try {{
     [IO.File]::WriteAllBytes($tmp, $bytes)
     $pw = ConvertTo-SecureString '{pfx_password}' -AsPlainText -Force
     $store = 'Cert:\\{self.store_location}\\{self.store_name}'
-    Import-PfxCertificate -FilePath $tmp -CertStoreLocation $store -Password $pw | Out-Null
+    Import-PfxCertificate -FilePath $tmp -CertStoreLocation $store -Password $pw{exportable_arg} | Out-Null
 }} finally {{
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     Remove-Item $b64file -Force -ErrorAction SilentlyContinue

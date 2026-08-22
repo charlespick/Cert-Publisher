@@ -163,6 +163,17 @@ spec:
                         storeName:
                           type: string
                           default: My
+                        exportablePrivateKey:
+                          type: boolean
+                          default: false
+                          description: >-
+                            Mark the private key exportable when importing
+                            into the Windows certificate store (certStore
+                            mode only). Windows doesn't support toggling this
+                            on an already-imported certificate, so changing
+                            it on an existing publication only takes effect
+                            the next time the certificate is renewed; the
+                            status message notes when this is pending.
                         certPath:
                           type: string
                         keyPath:
