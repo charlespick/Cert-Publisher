@@ -127,12 +127,23 @@ class _FakeResult:
 
 
 class _FakeWinRMSession:
-    """Records every PowerShell script run so uploads can be asserted on."""
+    """Records every PowerShell script run so uploads can be asserted on.
+
+    Mimics ``winrm.Session.run_cmd`` as invoked by ``WinRMProvisioner._run_ps``,
+    which builds its own ``<executable> -encodedcommand <b64>`` command line
+    so it can choose between ``powershell`` and ``pwsh``.
+    """
 
     def __init__(self):
         self.scripts = []
+        self.commands = []
 
-    def run_ps(self, script):
+    def run_cmd(self, command):
+        import base64
+
+        self.commands.append(command)
+        _, _, encoded = command.partition(" -encodedcommand ")
+        script = base64.b64decode(encoded).decode("utf_16_le")
         self.scripts.append(script)
         # GetTempFileName is used to allocate a remote scratch path.
         if script.strip() == "[IO.Path]::GetTempFileName()":
