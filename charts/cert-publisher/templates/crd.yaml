@@ -140,6 +140,24 @@ spec:
                         transport:
                           type: string
                           default: ntlm
+                          enum:
+                            - ntlm
+                            - kerberos
+                            - negotiate
+                            - basic
+                            - credssp
+                            - certificate
+                            - ssl
+                            - plaintext
+                          description: >-
+                            WinRM authentication protocol. NTLM works for
+                            workgroup and domain hosts alike; kerberos or
+                            negotiate is preferable where a domain service
+                            account is available. "ssl" and "plaintext" are
+                            accepted as legacy pywinrm spellings and both
+                            authenticate with basic over the HTTPS listener,
+                            which is the only listener cert-publisher talks to;
+                            prefer "basic" in new publications.
                         auth:
                           type: object
                           required: [secretRef]
@@ -180,20 +198,29 @@ spec:
                           type: string
                         postInstallScript:
                           type: string
+                          description: >-
+                            PowerShell run on the target after a successful
+                            install. Must be non-interactive: the run is
+                            unattended, so Read-Host, Get-Credential, nested
+                            prompts or unbound mandatory parameters fail the
+                            publication rather than waiting for an answer.
                         powershell:
                           type: string
                           enum: ["5.1", "7"]
                           default: "5.1"
                           description: >-
-                            PowerShell runtime used to run postInstallScript.
-                            "5.1" runs it with Windows PowerShell
-                            (powershell.exe), present on every supported
-                            Windows version. "7" runs it with PowerShell 7+
-                            (pwsh.exe), which must already be installed on the
-                            target host. The script's $env:CERT_PUBLISHER_THUMBPRINT is
-                            set either way to the newly installed
-                            certificate's SHA-1 thumbprint (40 uppercase hex
-                            characters, no separators).
+                            PSRP session configuration used to run
+                            postInstallScript. "5.1" uses the default Windows
+                            PowerShell endpoint, present on every supported
+                            Windows version. "7" uses the PowerShell.7
+                            endpoint, which PowerShell 7+ registers only when
+                            its remoting is enabled (the installer's "Enable
+                            PowerShell remoting" option, or Enable-PSRemoting
+                            run from pwsh) -- installing PowerShell 7 alone is
+                            not enough. The script's
+                            $env:CERT_PUBLISHER_THUMBPRINT is set either way to
+                            the newly installed certificate's SHA-1 thumbprint
+                            (40 uppercase hex characters, no separators).
             status:
               type: object
               properties:

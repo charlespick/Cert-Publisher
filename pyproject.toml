@@ -13,7 +13,7 @@ authors = [{ name = "Charles Pickering", email = "me@charlespick.xyz" }]
 dependencies = [
   "kubernetes>=29.0.0",
   "paramiko>=3.4.0",
-  "pywinrm>=0.4.3",
+  "pypsrp>=0.8.1",
   "cryptography>=42.0.0",
   "PyYAML>=6.0",
 ]
@@ -26,6 +26,11 @@ cert-publisher = "cert_publisher.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The WinRM provisioner runs static, parameterised PowerShell scripts
+# rather than assembling command text at runtime; they ship in the wheel.
+"cert_publisher.provisioners" = ["scripts/*.ps1"]
 
 [tool.ruff]
 line-length = 100

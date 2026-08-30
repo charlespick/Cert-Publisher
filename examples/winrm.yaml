@@ -44,7 +44,9 @@ spec:
       # postInstallScript: |
       #   Import-Module WebAdministration
       #   ...
-      # Optional: run postInstallScript with PowerShell 7 (pwsh.exe) instead
-      # of the default Windows PowerShell 5.1. PowerShell 7 must already be
-      # installed on the target host.
+      # Optional: run postInstallScript in PowerShell 7's PSRP endpoint
+      # instead of the default Windows PowerShell 5.1 one. PowerShell 7's
+      # remoting must already be enabled on the target host (the installer's
+      # "Enable PowerShell remoting" option, or Enable-PSRemoting from pwsh);
+      # installing PowerShell 7 alone is not enough.
       # powershell: "7"

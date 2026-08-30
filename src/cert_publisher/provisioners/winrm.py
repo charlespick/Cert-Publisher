@@ -1,23 +1,45 @@
-"""WinRM provisioner: install into the Windows cert store or drop files."""
+"""WinRM provisioner: install into the Windows cert store or drop files.
+
+Everything runs over PSRP (PowerShell Remoting Protocol) rather than a WinRS
+``cmd.exe`` shell. That matters for more than tidiness:
+
+* Commands execute inside a remote runspace hosted by ``wsmprovhost.exe``.
+  There is no ``cmd.exe``, no ``powershell.exe`` child process, and no
+  ``-EncodedCommand`` on any command line -- the three patterns that make
+  ordinary certificate installs look like commodity malware to EDR.
+* Arguments, including the PFX bytes and its password, are bound parameters
+  carried as CLIXML in the SOAP body. They never reach a command line, so they
+  never reach Sysmon EID 1, the WSMan operational log, or anything forwarding
+  those to a SIEM.
+* Payloads ride in the message body, which has no command-line length limit,
+  so a certificate is one pipeline rather than a burst of ~20 near-identical
+  process spawns.
+
+The scripts themselves are static files bundled in the package (see
+``scripts/``); nothing is assembled from interpolated data.
+"""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 import logging
-import re
 import secrets
 import socket
 import ssl
-import xml.etree.ElementTree as ET
+from functools import cache
+from importlib import resources
 
-import winrm
 from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption,
     load_pem_private_key,
     pkcs12,
 )
 from cryptography.x509 import load_pem_x509_certificates
+from pypsrp.complex_objects import Color, Coordinates, CultureInfo, ObjectMeta, Size
+from pypsrp.host import PSHost, PSHostRawUserInterface, PSHostUserInterface
+from pypsrp.powershell import DEFAULT_CONFIGURATION_NAME, PowerShell, RunspacePool
+from pypsrp.wsman import SUPPORTED_AUTHS, WSMan
 from requests.adapters import HTTPAdapter
 
 from ..retry import with_retries
@@ -29,40 +51,163 @@ log = logging.getLogger("cert-publisher.winrm")
 MODE_CERT_STORE = "certStore"
 MODE_FILE = "file"
 
-# Maximum base64 characters embedded in a single WinRM command. pywinrm wraps
-# every ``run_ps`` script as ``powershell -EncodedCommand <utf16-base64>``,
-# which inflates the script ~2.7x, and WinRS rejects over-long command lines
-# ("line too long"). A multi-KB certificate cannot ride in one command, so we
-# stream the payload to the remote host in chunks this size; 2000 leaves ample
-# headroom for the surrounding PowerShell after encoding.
-_UPLOAD_CHUNK = 2000
+# PSRP session configurations the postInstallScript can be run in. "5.1" is
+# Windows PowerShell's default endpoint, present on every supported Windows
+# version; "7" is the endpoint PowerShell 7+ registers when remoting is
+# enabled for it (the installer's "Enable PowerShell remoting" option, or
+# Enable-PSRemoting from within pwsh). Installing PowerShell 7 alone is not
+# enough -- unlike the old transport, cert-publisher no longer launches
+# pwsh.exe as a child process.
+_PS_CONFIGURATIONS = {"5.1": DEFAULT_CONFIGURATION_NAME, "7": "PowerShell.7"}
 
-# PowerShell runtimes the postInstallScript can be run under. "5.1" is
-# Windows PowerShell, present on every supported Windows version; "7" is
-# PowerShell 7+ (pwsh.exe), which must be installed separately on the target.
-_PS_EXECUTABLES = {"5.1": "powershell", "7": "pwsh"}
+# pywinrm transport names PSRP has no direct equivalent for. Both mean HTTP
+# Basic -- pywinrm distinguished them only by whether the listener was HTTPS,
+# which cert-publisher requires unconditionally -- so both map onto pypsrp's
+# "basic". Kept so publications written against the old transport keep
+# reconciling instead of erroring every run.
+_TRANSPORT_ALIASES = {"ssl": "basic", "plaintext": "basic"}
 
-_CLIXML_NS_RE = re.compile(rb'xmlns=*["\'][^"\']*["\']')
+
+@cache
+def _script(name: str) -> str:
+    """Return the text of a bundled PowerShell script.
+
+    Every remote operation runs one of these static, parameterised scripts, so
+    the text executed on the host is byte-identical across runs and across
+    hosts. That gives a SOC a stable thing to review and allowlist, instead of
+    a different dynamically-built blob every reconcile.
+    """
+    return (
+        resources.files(__package__).joinpath("scripts").joinpath(name).read_text(encoding="utf-8")
+    )
+
+
+def _refuse_interactive(what: str) -> None:
+    """Fail a host call that would need a human, instead of blocking on it."""
+    raise RuntimeError(
+        f"the remote script tried to {what}, but cert-publisher runs unattended "
+        "and cannot answer prompts; make the script non-interactive -- no "
+        "mandatory parameters without values, Read-Host, Get-Credential, or "
+        "nested prompts"
+    )
+
+
+class _UnattendedUI(PSHostUserInterface):
+    """A host UI that refuses to prompt rather than hanging on the request.
+
+    A runspace opened without a host answers *nothing* when the remote pipeline
+    makes a host call: pypsrp logs a warning and sends no response, so the
+    pipeline waits for an answer that never comes while ``poll_invoke``
+    silently swallows each WSMan operation timeout and asks again -- wedging
+    the CronJob run, which reconciles publications serially. The old
+    ``powershell.exe`` path failed fast instead, because stdin was closed.
+
+    Anything that prompts is a bug in an unattended hook, so refuse it loudly
+    and immediately. Non-interactive host calls (writes, progress, buffer
+    geometry) keep pypsrp's stock behaviour.
+    """
+
+    def ReadLine(self, runspace, pipeline):
+        _refuse_interactive("read a line of input")
+
+    def ReadLineAsSecureString(self, runspace, pipeline):
+        _refuse_interactive("read a password")
+
+    def Prompt(self, runspace, pipeline, caption, message, description):
+        _refuse_interactive(f"prompt for input ({caption or message!r})")
+
+    def PromptForCredential1(self, runspace, pipeline, caption, message, user_name, target_name):
+        _refuse_interactive("prompt for credentials")
+
+    def PromptForCredential2(
+        self,
+        runspace,
+        pipeline,
+        caption,
+        message,
+        user_name,
+        target_name,
+        allowed_credential_types,
+        options,
+    ):
+        _refuse_interactive("prompt for credentials")
+
+    def PromptForChoice(self, runspace, pipeline, caption, message, choices, default_choice):
+        _refuse_interactive(f"prompt for a choice ({caption or message!r})")
+
+
+class _UnattendedRawUI(PSHostRawUserInterface):
+    def ReadKey(self, runspace, pipeline, options=4):
+        _refuse_interactive("read a keypress")
+
+
+class _UnattendedHost(PSHost):
+    def EnterNestedPrompt(self, runspace, pipeline):
+        _refuse_interactive("enter a nested prompt")
+
+
+def _unattended_host() -> PSHost:
+    """Build the PSHost every runspace is opened with.
+
+    Every non-void host call has to return something: pypsrp only sends a
+    response when the method returns non-None, so a getter that answers None
+    leaves the remote pipeline waiting exactly like having no host at all.
+    That is why the culture, version and screen geometry below are all filled
+    in with real values rather than left to default.
+    """
+    culture = CultureInfo(
+        lcid=1033,
+        name="en-US",
+        display_name="English (United States)",
+        ietf_language_tag="en-US",
+        three_letter_iso_name="eng",
+        three_letter_windows_name="ENU",
+        two_letter_iso_language_name="en",
+    )
+    # A plausible headless console. PowerShell asks for these when formatting
+    # output width and when a script uses Write-Progress.
+    size = Size(width=120, height=3000)
+    raw_ui = _UnattendedRawUI(
+        window_title="cert-publisher",
+        cursor_size=25,
+        foreground_color=Color(value=Color.GRAY),
+        background_color=Color(value=Color.BLACK),
+        cursor_position=Coordinates(x=0, y=0),
+        window_position=Coordinates(x=0, y=0),
+        buffer_size=size,
+        max_physical_window_size=size,
+        max_window_size=size,
+        window_size=size,
+    )
+    return _UnattendedHost(
+        current_culture=culture,
+        current_ui_culture=culture,
+        debugger_enabled=False,
+        name="cert-publisher",
+        private_data=None,
+        ui=_UnattendedUI(raw_ui=raw_ui),
+        version="1.0.0",
+    )
 
 
 class _PinnedHTTPAdapter(HTTPAdapter):
     """A ``requests`` adapter that pins the TLS peer to a certificate thumbprint.
 
-    pywinrm is run with certificate validation disabled -- a WinRM listener's
+    pypsrp is run with certificate validation disabled -- a WinRM listener's
     self-signed cert chains to no CA -- so urllib3 would otherwise accept any
-    certificate on the connection that carries the auth exchange, the PFX
-    upload and the command output. This adapter re-adds the check that matters:
-    every connection urllib3 takes from the pool must present a leaf
-    certificate whose SHA-1 hash equals ``thumbprint`` (urllib3 accepts the
-    value with or without colons and in any case), or the socket is refused
-    before a single request byte is written. The check runs on the pooled
-    connection itself, so -- unlike a standalone probe -- it cannot be
-    satisfied by one connection while the session data rides another.
+    certificate on the connection that carries the auth exchange, the PFX and
+    the command output. This adapter re-adds the check that matters: every
+    connection urllib3 takes from the pool must present a leaf certificate
+    whose SHA-1 hash equals ``thumbprint`` (urllib3 accepts the value with or
+    without colons and in any case), or the socket is refused before a single
+    request byte is written. The check runs on the pooled connection itself,
+    so -- unlike a standalone probe -- it cannot be satisfied by one connection
+    while the session data rides another.
     """
 
-    def __init__(self, thumbprint: str) -> None:
+    def __init__(self, thumbprint: str, **kwargs) -> None:
         self._assert_fingerprint = thumbprint
-        super().__init__()
+        super().__init__(**kwargs)
 
     def init_poolmanager(self, *args, **kwargs) -> None:
         kwargs["assert_fingerprint"] = self._assert_fingerprint
@@ -75,24 +220,49 @@ class _PinnedHTTPAdapter(HTTPAdapter):
         return super().proxy_manager_for(*args, **kwargs)
 
 
-def _clean_ps_stderr(msg: bytes) -> bytes:
-    """Convert a PowerShell CLIXML error stream into plain text.
+def _error_text(powershell: PowerShell) -> str:
+    """Flatten a pipeline's error stream into one readable line."""
+    parts = []
+    for record in powershell.streams.error:
+        text = str(record).strip()
+        if text and text != "None":
+            parts.append(text)
+    return "; ".join(parts) or "no error detail returned by the host"
 
-    Reimplements ``winrm.Session._clean_error_msg`` locally: that method only
-    runs as part of ``Session.run_ps``, which hardcodes the ``powershell``
-    executable, and we need to pick between Windows PowerShell and
-    PowerShell 7.
+
+def _invoke(
+    pool: RunspacePool,
+    script_name: str,
+    parameters: dict | None = None,
+    secure_parameters: dict[str, str] | None = None,
+) -> list:
+    """Run a bundled script in ``pool`` and return its output objects.
+
+    ``parameters`` are bound by name to the script's ``param()`` block, with
+    Python types mapped by pypsrp (``bytes`` becomes ``byte[]``, ``bool``
+    becomes ``System.Boolean``, and so on). ``secure_parameters`` are bound as
+    ``SecureString``, encrypted under a session key the runspace pool
+    negotiates with the host -- which is why the key exchange has to happen
+    before they can be serialised at all.
     """
-    if not msg.startswith(b"#< CLIXML\r\n"):
-        return msg
-    msg_xml = _CLIXML_NS_RE.sub(b"", msg[11:])
-    try:
-        root = ET.fromstring(msg_xml)
-        parts = [s.text.replace("_x000D__x000A_", "\n") for s in root.findall("./S") if s.text]
-    except ET.ParseError:
-        return msg
-    new_msg = "".join(parts).strip()
-    return new_msg.encode("utf-8") if new_msg else msg
+    powershell = PowerShell(pool)
+    powershell.add_script(_script(script_name))
+    for name, value in (parameters or {}).items():
+        powershell.add_parameter(name, value)
+    if secure_parameters:
+        pool.exchange_keys()
+        for name, value in secure_parameters.items():
+            powershell.add_parameter(name, pool.serialize(value, ObjectMeta("SS")))
+
+    powershell.invoke()
+    if powershell.had_errors:
+        raise RuntimeError(f"{script_name} failed on the remote host: {_error_text(powershell)}")
+    if powershell.streams.error:
+        # Non-terminating errors don't fail the pipeline (the old transport
+        # didn't fail on them either, since powershell.exe still exited 0), but
+        # they're worth surfacing -- a post-install hook is the usual source.
+        log.warning("%s wrote to the error stream: %s", script_name, _error_text(powershell))
+    return powershell.output
 
 
 class WinRMProvisioner(Provisioner):
@@ -118,6 +288,20 @@ class WinRMProvisioner(Provisioner):
         self.port = port
         self.username = username
         self.thumbprint = thumbprint.replace(":", "").replace(" ", "").upper()
+        alias = _TRANSPORT_ALIASES.get(transport)
+        if alias is not None:
+            log.info(
+                "winrm transport %r is a legacy pywinrm name; authenticating "
+                "with %r over the HTTPS listener",
+                transport,
+                alias,
+            )
+            transport = alias
+        if transport not in SUPPORTED_AUTHS:
+            raise ValueError(
+                f"unsupported winrm transport: {transport!r} (expected one of "
+                f"{', '.join(sorted(set(SUPPORTED_AUTHS) | set(_TRANSPORT_ALIASES)))})"
+            )
         self.transport = transport
         self.credentials = credentials
         self.mode = mode
@@ -127,20 +311,20 @@ class WinRMProvisioner(Provisioner):
         self.key_path = key_path
         self.post_install_script = post_install_script
         self.exportable_private_key = exportable_private_key
-        if powershell not in _PS_EXECUTABLES:
+        if powershell not in _PS_CONFIGURATIONS:
             raise ValueError(
                 f"unsupported powershell runtime: {powershell!r} (expected '5.1' or '7')"
             )
         self.powershell = powershell
         # Set by is_current() when it detects the installed private key's
         # exportability doesn't match the desired setting; reconcile.py folds
-        # this into the status message. See _install_cert_store for why this
+        # this into the status message. See install-cert-store.ps1 for why this
         # can't just be fixed in place.
         self.pending_warning: str | None = None
 
     @property
-    def _post_install_executable(self) -> str:
-        return _PS_EXECUTABLES[self.powershell]
+    def _post_install_configuration(self) -> str:
+        return _PS_CONFIGURATIONS[self.powershell]
 
     @classmethod
     def from_spec(cls, spec: dict, kube, namespace: str) -> WinRMProvisioner:
@@ -174,7 +358,7 @@ class WinRMProvisioner(Provisioner):
         error (and retries transient network blips with backoff) before any
         credential is sent. It is *not* what secures the session: that is done
         by pinning the same thumbprint on the real request connection in
-        ``_session`` via :class:`_PinnedHTTPAdapter`, so a MITM cannot answer
+        ``_wsman`` via :class:`_PinnedHTTPAdapter`, so a MITM cannot answer
         this probe on one connection and serve the session on another.
         """
         ctx = ssl.create_default_context()
@@ -201,138 +385,91 @@ class WinRMProvisioner(Provisioner):
             )
         log.debug("WinRM endpoint %s:%d thumbprint verified", self.host, self.port)
 
-    def _session(self) -> winrm.Session:
+    # -- connection -------------------------------------------------------
+
+    def _wsman(self) -> WSMan:
         if not self.credentials.password:
             raise ValueError("winrm provisioner requires a password")
-        session = winrm.Session(
-            f"https://{self.host}:{self.port}/wsman",
-            auth=(self.username, self.credentials.password),
-            transport=self.transport,
+        wsman = WSMan(
+            self.host,
+            port=self.port,
+            username=self.username,
+            password=self.credentials.password,
+            ssl=True,
+            auth=self.transport,
             # There is no CA for a WinRM listener cert; the host is
             # authenticated by pinning its thumbprint on the connection that
             # actually carries the request (below), not by PKI validation.
-            server_cert_validation="ignore",
+            cert_validation=False,
         )
-        self._pin_session(session)
-        return session
+        self._pin_transport(wsman)
+        return wsman
 
-    def _pin_session(self, session: winrm.Session) -> None:
+    def _pin_transport(self, wsman: WSMan) -> None:
         """Bind the pinned thumbprint to the live request connection.
 
-        pywinrm builds a ``requests.Session`` lazily; force it now and mount an
-        adapter that makes urllib3 reject any TLS peer whose certificate hash
-        doesn't match. Every WinRM operation reuses this session, so the auth
-        handshake and all payloads (PFX, PFX password, command output) travel
-        only over a connection whose certificate has been checked -- closing
-        the gap between "verify" and "use".
-
-        ``build_session()`` itself sends a request *from inside the call* when
-        pywinrm negotiates message encryption (``message_encryption="always"``,
-        or ``"auto"`` over plain HTTP). cert-publisher always talks HTTPS and
-        leaves ``message_encryption`` at ``"auto"``, so that never happens and
-        mounting the adapter immediately after the call is safe. If that ever
-        changes, the pre-pin request must not go out unnoticed -- so bail
-        loudly rather than silently pinning too late.
+        pypsrp builds its ``requests.Session`` lazily, on the first send. Build
+        it now, mount an adapter that makes urllib3 reject any TLS peer whose
+        certificate hash doesn't match, and hand it back to the transport.
+        Every WSMan operation reuses this session, so the auth handshake and
+        all payloads (the PFX, its password, command output) travel only over a
+        connection whose certificate has been checked -- closing the gap
+        between "verify" and "use".
         """
-        transport = session.protocol.transport
-        requests_session = transport.build_session()
-        if transport.encryption is not None:
+        transport = wsman.transport
+        if transport.session is not None:
             raise RuntimeError(
-                "pywinrm negotiated message encryption while building the WinRM "
-                "session, which sends a request before the thumbprint pin is "
-                "mounted. Mount _PinnedHTTPAdapter before build_session() if "
-                "this configuration is intended."
+                "the WSMan transport already holds a request session, so a "
+                "request may have gone out before the thumbprint pin was "
+                "mounted; refusing to continue"
             )
-        requests_session.mount("https://", _PinnedHTTPAdapter(self.thumbprint))
-
-    def _run_ps(
-        self, session: winrm.Session, script: str, *, executable: str = "powershell"
-    ) -> str:
-        encoded = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
-        result = session.run_cmd(f"{executable} -encodedcommand {encoded}")
-        if result.status_code != 0:
-            raise RuntimeError(
-                f"PowerShell exited {result.status_code}: "
-                f"{_clean_ps_stderr(result.std_err).decode(errors='replace')}"
-            )
-        return result.std_out.decode(errors="replace")
-
-    # -- chunked upload ---------------------------------------------------
-
-    def _upload_b64(self, session: winrm.Session, data: bytes) -> str:
-        """Stream ``data`` to a remote temp file as base64, in WinRM-safe chunks.
-
-        Returns the path of the remote file holding the base64 text; callers
-        decode it on the far side. Splitting the payload across many small
-        commands keeps every WinRM command line well under the length limit that
-        a single inlined certificate would otherwise exceed. The base64 alphabet
-        contains no single quotes, so each chunk embeds safely in a PowerShell
-        literal.
-        """
-        b64 = base64.b64encode(data).decode()
-        remote = self._run_ps(session, "[IO.Path]::GetTempFileName()").strip()
-        for start in range(0, len(b64), _UPLOAD_CHUNK):
-            chunk = b64[start : start + _UPLOAD_CHUNK]
-            writer = "WriteAllText" if start == 0 else "AppendAllText"
-            self._run_ps(session, f"[IO.File]::{writer}('{remote}', '{chunk}')")
-        return remote
+        session = transport._build_session()
+        # Replace only the TLS behaviour; keep pypsrp's own retry policy.
+        existing = session.get_adapter(transport.endpoint)
+        session.mount(
+            "https://",
+            _PinnedHTTPAdapter(self.thumbprint, max_retries=existing.max_retries),
+        )
+        transport.session = session
 
     # -- provisioner interface -------------------------------------------
 
     def is_current(self, cert_pem: bytes) -> bool:
         self.pending_warning = None
         self._verify_endpoint()
-        session = self._session()
-        if self.mode == MODE_CERT_STORE:
-            thumb = sha1_thumbprint(cert_pem)
-            path = f"Cert:\\{self.store_location}\\{self.store_name}\\{thumb}"
-            out = self._run_ps(session, self._cert_store_probe_script(path)).strip()
-            if not out.startswith("present"):
-                return False
-            if out != "present:nokey":
-                self._check_exportable_drift(out)
-            return True
+        with self._wsman() as wsman, RunspacePool(wsman, host=_unattended_host()) as pool:
+            if self.mode == MODE_CERT_STORE:
+                return self._cert_store_is_current(pool, cert_pem)
+            return self._file_is_current(pool, cert_pem)
 
-        # file mode: compare the leaf thumbprint of the remote cert file, so
-        # PEM formatting or chain differences don't trigger spurious reinstalls.
-        remote = self._run_ps(
-            session,
-            f"if (Test-Path '{self.cert_path}') "
-            f"{{ [Convert]::ToBase64String([IO.File]::ReadAllBytes('{self.cert_path}')) }}",
-        ).strip()
+    def _cert_store_is_current(self, pool: RunspacePool, cert_pem: bytes) -> bool:
+        result = _first_line(
+            _invoke(
+                pool,
+                "probe-cert-store.ps1",
+                {
+                    "StoreLocation": self.store_location,
+                    "StoreName": self.store_name,
+                    "Thumbprint": sha1_thumbprint(cert_pem),
+                },
+            )
+        )
+        if not result.startswith("present"):
+            return False
+        if result != "present:nokey":
+            self._check_exportable_drift(result)
+        return True
+
+    def _file_is_current(self, pool: RunspacePool, cert_pem: bytes) -> bool:
+        # Compare the leaf thumbprint of the remote cert file, so PEM
+        # formatting or chain differences don't trigger spurious reinstalls.
+        remote = _first_line(_invoke(pool, "read-file-b64.ps1", {"Path": self.cert_path}))
         if not remote:
             return False
         try:
             return sha1_thumbprint(base64.b64decode(remote)) == sha1_thumbprint(cert_pem)
         except ValueError:
             return False  # remote file isn't a parseable certificate
-
-    @staticmethod
-    def _cert_store_probe_script(path: str) -> str:
-        """Report whether ``path`` exists and, if so, whether its private key
-        is exportable.
-
-        Exportability can't be read reliably via ``CspKeyContainerInfo`` (it
-        throws for CNG-backed keys, which is what modern Windows uses by
-        default), so this probes the only way that works across both CAPI and
-        CNG: attempt an in-memory PKCS#12 export and see if it's refused. The
-        exported bytes never leave the remote process or touch disk.
-        """
-        return f"""
-$c = Get-Item '{path}' -ErrorAction SilentlyContinue
-if (-not $c) {{
-    'absent'
-}} elseif (-not $c.HasPrivateKey) {{
-    'present:nokey'
-}} else {{
-    $exportable = $false
-    try {{
-        [void]$c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, 'cert-publisher-probe')
-        $exportable = $true
-    }} catch {{}}
-    if ($exportable) {{ 'present:exportable' }} else {{ 'present:sealed' }}
-}}
-"""
 
     def _check_exportable_drift(self, probe_result: str) -> None:
         actual_exportable = probe_result == "present:exportable"
@@ -354,24 +491,26 @@ if (-not $c) {{
             )
 
     def install(self, cert_pem: bytes, key_pem: bytes) -> None:
-        self._verify_endpoint()
-        session = self._session()
-        if self.mode == MODE_CERT_STORE:
-            self._install_cert_store(session, cert_pem, key_pem)
-        elif self.mode == MODE_FILE:
-            self._install_files(session, cert_pem, key_pem)
-        else:
+        if self.mode not in (MODE_CERT_STORE, MODE_FILE):
             raise ValueError(f"unknown winrm mode: {self.mode!r}")
+        self._verify_endpoint()
+        with self._wsman() as wsman:
+            with RunspacePool(wsman, host=_unattended_host()) as pool:
+                if self.mode == MODE_CERT_STORE:
+                    self._install_cert_store(pool, cert_pem, key_pem)
+                else:
+                    self._install_files(pool, cert_pem, key_pem)
 
-        if self.post_install_script:
-            log.info("[%s] running post-install script", self.host)
-            self._run_post_install(session, cert_pem)
+            if self.post_install_script:
+                log.info("[%s] running post-install script", self.host)
+                self._run_post_install(wsman, cert_pem)
 
-    def _install_cert_store(
-        self, session: winrm.Session, cert_pem: bytes, key_pem: bytes
-    ) -> None:
+    def _install_cert_store(self, pool: RunspacePool, cert_pem: bytes, key_pem: bytes) -> None:
         certs = load_pem_x509_certificates(cert_pem)
         key = load_pem_private_key(key_pem, password=None)
+        # The PFX is encrypted in transit under a random single-use password
+        # that only ever exists as a bound SecureString parameter. Neither the
+        # blob nor the password touches a command line or the remote disk.
         pfx_password = secrets.token_urlsafe(24)
         pfx = pkcs12.serialize_key_and_certificates(
             name=b"cert-publisher",
@@ -380,74 +519,50 @@ if (-not $c) {{
             cas=certs[1:] or None,
             encryption_algorithm=BestAvailableEncryption(pfx_password.encode()),
         )
-        b64file = self._upload_b64(session, pfx)
-        exportable_arg = " -Exportable" if self.exportable_private_key else ""
-        script = f"""
-$ErrorActionPreference = 'Stop'
-$b64file = '{b64file}'
-$tmp = [IO.Path]::GetTempFileName()
-try {{
-    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
-    [IO.File]::WriteAllBytes($tmp, $bytes)
-    $pw = ConvertTo-SecureString '{pfx_password}' -AsPlainText -Force
-    $store = 'Cert:\\{self.store_location}\\{self.store_name}'
-    Import-PfxCertificate -FilePath $tmp -CertStoreLocation $store -Password $pw{exportable_arg} | Out-Null
-}} finally {{
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
-}}
-"""
-        self._run_ps(session, script)
+        _invoke(
+            pool,
+            "install-cert-store.ps1",
+            {
+                "PfxBytes": pfx,
+                "StoreLocation": self.store_location,
+                "StoreName": self.store_name,
+                "Exportable": self.exportable_private_key,
+            },
+            secure_parameters={"Password": pfx_password},
+        )
 
-    def _install_files(
-        self, session: winrm.Session, cert_pem: bytes, key_pem: bytes
-    ) -> None:
-        self._write_file(session, self.cert_path, cert_pem)
+    def _install_files(self, pool: RunspacePool, cert_pem: bytes, key_pem: bytes) -> None:
+        self._write_file(pool, self.cert_path, cert_pem)
         if self.key_path:
-            self._write_file(session, self.key_path, key_pem)
+            self._write_file(pool, self.key_path, key_pem)
 
-    def _write_file(self, session: winrm.Session, path: str, data: bytes) -> None:
-        b64file = self._upload_b64(session, data)
-        script = f"""
-$ErrorActionPreference = 'Stop'
-$b64file = '{b64file}'
-try {{
-    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
-    [IO.File]::WriteAllBytes('{path}', $bytes)
-}} finally {{
-    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
-}}
-"""
-        self._run_ps(session, script)
+    def _write_file(self, pool: RunspacePool, path: str, data: bytes) -> None:
+        _invoke(pool, "write-file.ps1", {"Path": path, "Content": data})
 
-    def _run_post_install(self, session: winrm.Session, cert_pem: bytes) -> None:
-        """Upload the post-install hook and run it by path, never inlined.
+    def _run_post_install(self, wsman: WSMan, cert_pem: bytes) -> None:
+        """Run the operator-supplied hook in its own runspace.
 
-        Operator-supplied scripts can be arbitrarily long, so we stream the
-        script to a remote ``.ps1`` file (chunked, like certificate uploads) and
-        dot-source it rather than embedding it in a single command. Base64 also
-        sidesteps any quoting hazards in the script text itself.
-
-        The just-installed leaf's thumbprint is exposed to the hook as
-        ``$env:CERT_PUBLISHER_THUMBPRINT`` — 40 uppercase hex characters, no colons or
-        spaces, matching Windows' own ``Cert:\\`` thumbprint formatting and
-        the literal form most .NET-based tooling (e.g. Veeam) expects.
+        It gets a separate pool because ``powershell: "7"`` selects a different
+        PSRP session configuration; the install itself always runs in the
+        default Windows PowerShell endpoint. The host matters most here -- this
+        is the one script cert-publisher didn't write, so it's the one that
+        might try to prompt.
         """
-        thumbprint = sha1_thumbprint(cert_pem)
-        b64file = self._upload_b64(session, self.post_install_script.encode("utf-8"))
-        script = f"""
-$ErrorActionPreference = 'Stop'
-$b64file = '{b64file}'
-$hook = [IO.Path]::Combine([IO.Path]::GetTempPath(), [IO.Path]::GetRandomFileName() + '.ps1')
-try {{
-    $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($b64file))
-    [IO.File]::WriteAllBytes($hook, $bytes)
-    $env:CERT_PUBLISHER_THUMBPRINT = '{thumbprint}'
-    & $hook
-    if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
-}} finally {{
-    Remove-Item $hook -Force -ErrorAction SilentlyContinue
-    Remove-Item $b64file -Force -ErrorAction SilentlyContinue
-}}
-"""
-        self._run_ps(session, script, executable=self._post_install_executable)
+        with RunspacePool(
+            wsman,
+            configuration_name=self._post_install_configuration,
+            host=_unattended_host(),
+        ) as pool:
+            _invoke(
+                pool,
+                "run-post-install.ps1",
+                {
+                    "Script": self.post_install_script,
+                    "Thumbprint": sha1_thumbprint(cert_pem),
+                },
+            )
+
+
+def _first_line(output: list) -> str:
+    """Return the first output object as stripped text, or "" if there was none."""
+    return str(output[0]).strip() if output else ""

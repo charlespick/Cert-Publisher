@@ -67,7 +67,7 @@ the connection that actually carries the session, so PKI validation is not
 relied on — authenticates over the configured transport (NTLM by default),
 and either:
 
-- **`certStore`** — imports the cert + key as a PFX into a `Cert:\` store
+- **`certStore`** — imports the cert + key as a PFX into a certificate store
   (`LocalMachine\My` by default), or
 - **`file`** — writes the cert (and key) to a path.
 
@@ -75,8 +75,47 @@ Both modes support an optional post-install PowerShell script. The script
 runs with `$env:CERT_PUBLISHER_THUMBPRINT` set to the newly installed certificate's
 SHA-1 thumbprint (40 uppercase hex characters, no colons or spaces — the
 literal form Windows and most .NET tooling expect). It runs under Windows
-PowerShell 5.1 by default; set `powershell: "7"` to run it with PowerShell 7
-(`pwsh.exe`) instead, which must already be installed on the target host.
+PowerShell 5.1 by default; set `powershell: "7"` to run it in the
+`PowerShell.7` remoting endpoint instead (see below).
+
+#### How it executes on the host
+
+Commands run over PSRP (PowerShell Remoting Protocol) — the same protocol
+`Enter-PSSession` and Ansible's `psrp` connection plugin use — not a WinRS
+`cmd.exe` shell. This matters if the target host is watched by EDR or forwards
+process telemetry to a SIEM:
+
+- Everything executes inside a remote runspace hosted by `wsmprovhost.exe`.
+  There is no `cmd.exe`, no `powershell.exe` child process, and no
+  `-EncodedCommand` on any command line — the patterns that make an ordinary
+  certificate install look like a commodity dropper.
+- The PFX and its one-time password are **bound parameters** (a `byte[]` and a
+  `SecureString`) carried as CLIXML in the SOAP body. They never touch a
+  command line, so they never reach Sysmon EID 1, the WSMan operational log, or
+  anything forwarding those onward.
+- `certStore` installs are done fully in memory via the .NET store API. No PFX
+  or private key is written to the remote filesystem, and there is no temp-file
+  window to ACL.
+- Each operation is a single pipeline running one of the static, parameterised
+  scripts bundled in the package
+  ([`src/cert_publisher/provisioners/scripts/`](src/cert_publisher/provisioners/scripts/)),
+  so the script text on the host is byte-identical every run — reviewable, and
+  stable enough to hash and allowlist.
+
+The one remaining exception is `postInstallScript`, which is still written to a
+temp `.ps1` and run by path so operator scripts keep working unchanged.
+
+The hook must be non-interactive — no `Read-Host`, `Get-Credential`, nested
+prompts, or mandatory parameters left without a value. There is no operator
+attached to a CronJob run, so any prompt fails the publication immediately with
+a message naming the call that was refused.
+
+`powershell: "7"` selects the `PowerShell.7` PSRP session configuration rather
+than launching `pwsh.exe`. That endpoint is registered by PowerShell 7's
+"Enable PowerShell remoting" installer option, or by running `Enable-PSRemoting`
+from within `pwsh`; simply having PowerShell 7 installed is not enough.
+
+#### Exportable private keys
 
 `certStore` mode also supports `exportablePrivateKey`, which marks the
 imported private key exportable. Windows fixes a private key's exportability
@@ -86,6 +125,15 @@ do on your behalf since that's a destructive operation cert-manager didn't
 ask for. So enabling `exportablePrivateKey` on a publication that's already
 published takes effect the next time the certificate is renewed; until then
 the reconcile is a no-op and the status message says the setting is pending.
+
+#### Transport names
+
+`transport` accepts pypsrp's names: `ntlm` (the default), `kerberos`,
+`negotiate`, `basic`, `credssp` and `certificate`. The pywinrm spellings `ssl`
+and `plaintext` are still accepted and both authenticate with `basic` over the
+HTTPS listener — the only listener cert-publisher talks to, which is what those
+two names distinguished. Existing publications keep reconciling unchanged;
+prefer `basic` in new ones.
 
 ### Credentials
 
@@ -155,6 +203,7 @@ The package lives in `src/cert_publisher/`:
 | `certmanager.py` | Builds the owned cert-manager `Certificate` |
 | `kube.py` | Kubernetes API access |
 | `provisioners/` | `ssh` and `winrm` install backends |
+| `provisioners/scripts/` | Static PowerShell run by the WinRM provisioner |
 | `utils.py` | Certificate parsing / fingerprints |
 
 ## License
