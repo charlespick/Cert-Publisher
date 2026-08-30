@@ -62,8 +62,10 @@ SFTP with the requested file modes, and runs an optional post-install script.
 
 ### WinRM (Windows)
 
-Verifies the WinRM HTTPS listener against a pinned SHA-1 thumbprint,
-authenticates over the configured transport (NTLM by default), and either:
+Pins the WinRM HTTPS listener to a configured SHA-1 thumbprint — enforced on
+the connection that actually carries the session, so PKI validation is not
+relied on — authenticates over the configured transport (NTLM by default),
+and either:
 
 - **`certStore`** — imports the cert + key as a PFX into a `Cert:\` store
   (`LocalMachine\My` by default), or

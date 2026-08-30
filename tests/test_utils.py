@@ -189,6 +189,117 @@ def test_winrm_upload_chunks_stay_within_command_limit():
     assert joined == b64
 
 
+def test_winrm_session_pins_thumbprint_on_live_connection(monkeypatch):
+    import requests
+
+    from cert_publisher.provisioners import winrm as winrm_mod
+
+    real_requests_session = requests.Session()
+
+    class _FakeTransport:
+        encryption = None
+
+        def build_session(self):
+            return real_requests_session
+
+    class _FakeProtocol:
+        transport = _FakeTransport()
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+            self.protocol = _FakeProtocol()
+
+    monkeypatch.setattr(winrm_mod.winrm, "Session", _FakeSession)
+
+    prov = _winrm_provisioner()  # thumbprint "AA:BB" normalises to "AABB"
+    session = prov._session()
+
+    # pywinrm itself is told not to validate; the pin is enforced on the real
+    # request connection instead.
+    assert session.kwargs["server_cert_validation"] == "ignore"
+    adapter = real_requests_session.get_adapter("https://win01.example.com:5986/wsman")
+    assert isinstance(adapter, winrm_mod._PinnedHTTPAdapter)
+    pool_kw = adapter.poolmanager.connection_pool_kw
+    assert pool_kw["assert_fingerprint"] == "AABB"
+    assert pool_kw["cert_reqs"] == "CERT_NONE"
+
+
+def test_pinned_adapter_accepts_matching_cert_and_rejects_others(tmp_path):
+    """Prove the pin actually enforces the thumbprint on a live TLS handshake,
+    not just that the right kwargs reach urllib3."""
+    import hashlib
+    import http.server
+    import ssl
+    import threading
+
+    import requests
+
+    from cert_publisher.provisioners.winrm import _PinnedHTTPAdapter
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    cert_file = tmp_path / "cert.pem"
+    key_file = tmp_path / "key.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    der = cert.public_bytes(serialization.Encoding.DER)
+    matching = hashlib.sha1(der).hexdigest().upper()
+
+    class _QuietHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_file, key_file)
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _QuietHandler)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    # Swallow the connection-reset noise from handshakes the client aborts.
+    httpd.handle_error = lambda request, client_address: None
+    port = httpd.socket.getsockname()[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        url = f"https://127.0.0.1:{port}/"
+
+        ok = requests.Session()
+        ok.verify = False
+        ok.mount("https://", _PinnedHTTPAdapter(matching))
+        # The server has no GET handler, so a 501 back proves the TLS peer was
+        # accepted. urllib3 normalises the fingerprint, so lower-case matches too.
+        assert ok.get(url, timeout=5).status_code == 501
+        ok.mount("https://", _PinnedHTTPAdapter(matching.lower()))
+        assert ok.get(url, timeout=5).status_code == 501
+
+        bad = requests.Session()
+        bad.verify = False
+        bad.mount("https://", _PinnedHTTPAdapter("0" * 40))
+        try:
+            bad.get(url, timeout=5)
+            raise AssertionError("expected the pinned adapter to reject the cert")
+        except requests.exceptions.SSLError:
+            pass
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_winrm_write_file_uploads_via_temp_file():
     prov = _winrm_provisioner()
     session = _FakeWinRMSession()

@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.serialization import (
     pkcs12,
 )
 from cryptography.x509 import load_pem_x509_certificates
+from requests.adapters import HTTPAdapter
 
 from ..retry import with_retries
 from ..utils import sha1_thumbprint
@@ -42,6 +43,36 @@ _UPLOAD_CHUNK = 2000
 _PS_EXECUTABLES = {"5.1": "powershell", "7": "pwsh"}
 
 _CLIXML_NS_RE = re.compile(rb'xmlns=*["\'][^"\']*["\']')
+
+
+class _PinnedHTTPAdapter(HTTPAdapter):
+    """A ``requests`` adapter that pins the TLS peer to a certificate thumbprint.
+
+    pywinrm is run with certificate validation disabled -- a WinRM listener's
+    self-signed cert chains to no CA -- so urllib3 would otherwise accept any
+    certificate on the connection that carries the auth exchange, the PFX
+    upload and the command output. This adapter re-adds the check that matters:
+    every connection urllib3 takes from the pool must present a leaf
+    certificate whose SHA-1 hash equals ``thumbprint`` (urllib3 accepts the
+    value with or without colons and in any case), or the socket is refused
+    before a single request byte is written. The check runs on the pooled
+    connection itself, so -- unlike a standalone probe -- it cannot be
+    satisfied by one connection while the session data rides another.
+    """
+
+    def __init__(self, thumbprint: str) -> None:
+        self._assert_fingerprint = thumbprint
+        super().__init__()
+
+    def init_poolmanager(self, *args, **kwargs) -> None:
+        kwargs["assert_fingerprint"] = self._assert_fingerprint
+        kwargs["cert_reqs"] = "CERT_NONE"
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        kwargs["assert_fingerprint"] = self._assert_fingerprint
+        kwargs["cert_reqs"] = "CERT_NONE"
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 def _clean_ps_stderr(msg: bytes) -> bytes:
@@ -137,11 +168,14 @@ class WinRMProvisioner(Provisioner):
     # -- host verification ------------------------------------------------
 
     def _verify_endpoint(self) -> None:
-        """Pin the WinRM HTTPS listener to the configured SHA-1 thumbprint.
+        """Pre-flight the WinRM HTTPS listener against the configured thumbprint.
 
-        Establishing the TLS connection is retried with backoff: a briefly
-        unreachable or slow-to-answer host is a transient condition and
-        shouldn't fail the whole reconcile on the first timeout.
+        This is a fast fail-early check that gives a clear "expected X, got Y"
+        error (and retries transient network blips with backoff) before any
+        credential is sent. It is *not* what secures the session: that is done
+        by pinning the same thumbprint on the real request connection in
+        ``_session`` via :class:`_PinnedHTTPAdapter`, so a MITM cannot answer
+        this probe on one connection and serve the session on another.
         """
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -170,12 +204,46 @@ class WinRMProvisioner(Provisioner):
     def _session(self) -> winrm.Session:
         if not self.credentials.password:
             raise ValueError("winrm provisioner requires a password")
-        return winrm.Session(
+        session = winrm.Session(
             f"https://{self.host}:{self.port}/wsman",
             auth=(self.username, self.credentials.password),
             transport=self.transport,
-            server_cert_validation="ignore",  # verified out-of-band by thumbprint
+            # There is no CA for a WinRM listener cert; the host is
+            # authenticated by pinning its thumbprint on the connection that
+            # actually carries the request (below), not by PKI validation.
+            server_cert_validation="ignore",
         )
+        self._pin_session(session)
+        return session
+
+    def _pin_session(self, session: winrm.Session) -> None:
+        """Bind the pinned thumbprint to the live request connection.
+
+        pywinrm builds a ``requests.Session`` lazily; force it now and mount an
+        adapter that makes urllib3 reject any TLS peer whose certificate hash
+        doesn't match. Every WinRM operation reuses this session, so the auth
+        handshake and all payloads (PFX, PFX password, command output) travel
+        only over a connection whose certificate has been checked -- closing
+        the gap between "verify" and "use".
+
+        ``build_session()`` itself sends a request *from inside the call* when
+        pywinrm negotiates message encryption (``message_encryption="always"``,
+        or ``"auto"`` over plain HTTP). cert-publisher always talks HTTPS and
+        leaves ``message_encryption`` at ``"auto"``, so that never happens and
+        mounting the adapter immediately after the call is safe. If that ever
+        changes, the pre-pin request must not go out unnoticed -- so bail
+        loudly rather than silently pinning too late.
+        """
+        transport = session.protocol.transport
+        requests_session = transport.build_session()
+        if transport.encryption is not None:
+            raise RuntimeError(
+                "pywinrm negotiated message encryption while building the WinRM "
+                "session, which sends a request before the thumbprint pin is "
+                "mounted. Mount _PinnedHTTPAdapter before build_session() if "
+                "this configuration is intended."
+            )
+        requests_session.mount("https://", _PinnedHTTPAdapter(self.thumbprint))
 
     def _run_ps(
         self, session: winrm.Session, script: str, *, executable: str = "powershell"
