@@ -180,19 +180,35 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
     # 3. Renewal is wanted -- but if we only just signed, the last round did not
     #    achieve it. Signing again would rotate the key and reset the BMC on
     #    every run, so stop and say so instead.
+    #
+    #    Unless the publication itself changed since we last looked: editing it
+    #    is an operator saying "I've addressed that", and making them wait out
+    #    a rate limit aimed at runaway retries would be the wrong answer to a
+    #    deliberate act.
     since = _time_since(status.get("lastSigningTime"))
-    if since is not None and since < _SIGNING_COOLDOWN:
+    # Absent observedGeneration means we cannot tell whether the spec moved, so
+    # keep the rate limit: it exists to stop repeated BMC reboots, and the safe
+    # default when uncertain is to hold rather than retry.
+    observed = status.get("observedGeneration")
+    spec_changed = observed is not None and observed != meta.get("generation")
+    if not spec_changed and since is not None and since < _SIGNING_COOLDOWN:
+        remaining = _SIGNING_COOLDOWN - since
         log.error("[%s] still needs renewal right after signing: %s", ref, reason)
         set_status(
             kube, pub, ERROR,
             f"A signing round started less than {_SIGNING_COOLDOWN} ago but "
             f"the host still needs renewal ({reason}); not starting another "
-            f"yet. If a certificate was imported, check that the iDRAC "
-            f"restarted to apply it and that it carries the expected subject "
-            f"alternative names. If no certificate was issued, check the "
-            f"issuer and any approver policy for this namespace.",
+            f"for {remaining}. If a certificate was imported, check that the "
+            f"iDRAC restarted to apply it and that it carries the expected "
+            f"subject alternative names. If no certificate was issued, check "
+            f"the issuer and any approver policy for this namespace. Editing "
+            f"the publication retries immediately; so does clearing "
+            f".status.lastSigningTime.",
         )
         return
+    if spec_changed and since is not None and since < _SIGNING_COOLDOWN:
+        log.info("[%s] publication changed; retrying without waiting out the "
+                 "signing cooldown", ref)
 
     # 4. Have the host mint a CSR and ask cert-manager to sign it.
     log.info("[%s] renewing: %s", ref, reason)

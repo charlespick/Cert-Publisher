@@ -1045,7 +1045,7 @@ def test_the_cooldown_message_does_not_claim_an_import_happened(monkeypatch):
 
 def test_key_usages_come_from_the_csr_not_the_publication():
     """cert-manager demands the declared key usages match the CSR exactly."""
-    from cert_publisher.certmanager import csr_key_usages
+    from cert_publisher.certmanager import csr_usages
 
     # An iDRAC8 encodes contentCommitment, which no publication here declares.
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -1063,7 +1063,7 @@ def test_key_usages_come_from_the_csr_not_the_publication():
         .sign(key, hashes.SHA256())
         .public_bytes(serialization.Encoding.PEM)
     )
-    assert csr_key_usages(csr) == [
+    assert csr_usages(csr) == [
         "digital signature", "content commitment", "key encipherment",
     ]
 
@@ -1071,14 +1071,15 @@ def test_key_usages_come_from_the_csr_not_the_publication():
         _pub(usages=["server auth", "digital signature", "key encipherment"]),
         "n", csr,
     )
-    # Key usages replaced by the CSR's; the extended key usage carried through.
+    # The CSR carries no extendedKeyUsage, so no extended usage is declared --
+    # declaring "server auth" is exactly what cert-manager rejected.
     assert body["spec"]["usages"] == [
-        "digital signature", "content commitment", "key encipherment", "server auth",
+        "digital signature", "content commitment", "key encipherment",
     ]
 
 
 def test_a_csr_without_key_usages_falls_back_to_the_publication():
-    from cert_publisher.certmanager import csr_key_usages
+    from cert_publisher.certmanager import csr_usages
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     csr = (
@@ -1087,8 +1088,76 @@ def test_a_csr_without_key_usages_falls_back_to_the_publication():
         .sign(key, hashes.SHA256())
         .public_bytes(serialization.Encoding.PEM)
     )
-    assert csr_key_usages(csr) == []
+    assert csr_usages(csr) == []
     body = build_certificate_request_body(_pub(usages=["server auth"]), "n", csr)
-    assert body["spec"]["usages"] == ["server auth"]
+    assert "usages" not in body["spec"]
 
 
+
+
+def test_editing_the_publication_clears_the_signing_cooldown(monkeypatch):
+    """An operator fixing the spec shouldn't have to wait out a retry limit."""
+    kube = _FakeKube()
+    prov = _FakeProv(installed=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: prov)
+
+    pub = _pub(status={
+        "lastSigningTime": _stamp(datetime.timedelta(minutes=-5)),
+        "observedGeneration": 1,
+    })
+    pub["metadata"]["generation"] = 2  # the spec was edited
+
+    reconcile_mod.reconcile_publication(kube, pub)
+
+    assert prov.csr_args is not None
+    assert len(kube.created) == 1
+    assert kube.status["phase"] == PENDING
+
+
+def test_the_cooldown_still_holds_when_the_spec_is_unchanged(monkeypatch):
+    kube = _FakeKube()
+    prov = _FakeProv(installed=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: prov)
+
+    pub = _pub(status={
+        "lastSigningTime": _stamp(datetime.timedelta(minutes=-5)),
+        "observedGeneration": 1,
+    })
+    pub["metadata"]["generation"] = 1
+
+    reconcile_mod.reconcile_publication(kube, pub)
+
+    assert prov.csr_args is None
+    assert kube.status["phase"] == ERROR
+    assert "Editing the publication retries immediately" in kube.status["message"]
+
+
+def test_extended_key_usages_are_derived_when_the_csr_carries_them():
+    """Hosts that do encode an EKU should have it declared, unlike an iDRAC8."""
+    from cert_publisher.certmanager import csr_usages
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "h.example.com")]))
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=True,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([
+                x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
+            ]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
+    assert csr_usages(csr) == [
+        "digital signature", "key encipherment", "server auth", "client auth",
+    ]

@@ -89,34 +89,55 @@ _KEY_USAGE_NAMES = (
     ("crl_sign", "crl sign"),
 )
 
-# Everything in spec.usages that is NOT a key usage, i.e. the extended key
-# usages, which are carried through from the publication unchanged.
-_KEY_USAGE_VALUES = frozenset(name for _, name in _KEY_USAGE_NAMES) | {"signing"}
+# cert-manager extended-key-usage names by OID. An iDRAC8's CSR carries no
+# extendedKeyUsage extension at all, but other hosts may.
+_EXT_KEY_USAGE_NAMES = {
+    "1.3.6.1.5.5.7.3.1": "server auth",
+    "1.3.6.1.5.5.7.3.2": "client auth",
+    "1.3.6.1.5.5.7.3.3": "code signing",
+    "1.3.6.1.5.5.7.3.4": "email protection",
+    "1.3.6.1.5.5.7.3.8": "timestamping",
+    "1.3.6.1.5.5.7.3.9": "ocsp signing",
+    "2.5.29.37.0": "any",
+}
 
 
-def csr_key_usages(csr_pem: bytes) -> list[str]:
-    """The cert-manager key-usage names encoded in a CSR's keyUsage extension.
+def csr_usages(csr_pem: bytes) -> list[str]:
+    """The cert-manager usage names a CSR actually encodes.
 
-    cert-manager refuses a CertificateRequest whose declared key usages differ
-    at all from the ones the CSR actually encodes. When the CSR comes from the
-    host rather than from us, the host decides -- so the usages have to be read
-    off the CSR instead of asserted from the publication.
+    cert-manager refuses a CertificateRequest whose declared usages differ at
+    all from the CSR's -- key usages *and* extended key usages, checked in that
+    order. When the CSR comes from the host rather than from us, the host
+    decides, so both have to be read off the CSR rather than asserted from the
+    publication. An iDRAC8 encodes keyUsage but no extendedKeyUsage, so nothing
+    extended is declared for it; the CA still issues the extended key usages its
+    own policy requires (Let's Encrypt always marks server auth).
     """
     csr = x509.load_pem_x509_csr(csr_pem)
+    usages = []
+
     try:
         key_usage = csr.extensions.get_extension_for_class(x509.KeyUsage).value
     except x509.ExtensionNotFound:
-        return []
+        key_usage = None
+    if key_usage is not None:
+        for attribute, name in _KEY_USAGE_NAMES:
+            try:
+                if getattr(key_usage, attribute):
+                    usages.append(name)
+            except ValueError:
+                # encipher_only/decipher_only raise unless key_agreement is
+                # set; the attributes read here never do, but stay defensive.
+                continue
 
-    usages = []
-    for attribute, name in _KEY_USAGE_NAMES:
-        try:
-            if getattr(key_usage, attribute):
-                usages.append(name)
-        except ValueError:
-            # encipher_only/decipher_only raise unless key_agreement is set;
-            # the attributes read here never do, but stay defensive.
-            continue
+    try:
+        extended = csr.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        return usages
+    for oid in extended:
+        name = _EXT_KEY_USAGE_NAMES.get(oid.dotted_string)
+        if name is not None:
+            usages.append(name)
     return usages
 
 
@@ -133,11 +154,11 @@ def build_certificate_request_body(pub: dict, name: str, csr_pem: bytes) -> dict
     meta = pub["metadata"]
     spec = pub["spec"]
 
-    # Key usages are read from the CSR because the host encoded them and
-    # cert-manager demands an exact match; extended key usages (server auth and
-    # friends) are not in the CSR, so those still come from the publication.
-    extended = [u for u in spec.get("usages", []) if u not in _KEY_USAGE_VALUES]
-    usages = csr_key_usages(csr_pem) + extended
+    # Usages are read from the CSR, not from the publication: the host encoded
+    # them and cert-manager demands an exact match on both key usages and
+    # extended key usages. spec.usages still drives the Secret-keyed path,
+    # where cert-manager generates the key and we do decide.
+    usages = csr_usages(csr_pem)
 
     request_spec: dict = {
         "request": base64.b64encode(csr_pem).decode(),
