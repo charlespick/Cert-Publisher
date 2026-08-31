@@ -1,0 +1,75 @@
+# Publish the web GUI certificate to a Dell 12th/13th-gen PowerEdge (iDRAC8).
+#
+# Unlike the ssh and winrm provisioners, no private key is sent to the host.
+# An iDRAC8 has no key-upload path over any API this project can use, so it
+# generates its own keypair and a CSR; cert-manager signs the CSR through a
+# CertificateRequest and the signed certificate is imported back.
+#
+# Because a CertificateRequest is signed once and never renewed, cert-publisher
+# owns renewal timing for this provisioner: it renews once the certificate the
+# iDRAC is serving is inside renewBefore of expiry (defaulting to the final
+# third of its lifetime).
+#
+# Note that importing restarts the iDRAC, dropping active iKVM and virtual
+# media sessions. The host OS is unaffected.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: idrac01-creds
+  namespace: default
+type: Opaque
+stringData:
+  # An iDRAC user with the Configure iDRAC privilege. Prefer a dedicated local
+  # iDRAC account: Active Directory accounts are commonly rejected for API
+  # access on this generation, and a service account avoids tying certificate
+  # renewal to a human's credentials.
+  password: "replace-me"
+---
+apiVersion: certpublisher.makerland.xyz/v1alpha1
+kind: CertPublication
+metadata:
+  name: idrac01
+  namespace: default
+spec:
+  dnsNames:
+    - idrac01.example.com
+  issuerRef:
+    name: internal-ca
+    kind: ClusterIssuer
+  # Renew once under 30 days remain. Omit to renew in the final third of the
+  # certificate's lifetime.
+  renewBefore: 720h
+  provisioner:
+    type: idrac8
+    idrac8:
+      # Use the DNS name in the certificate: once a trusted certificate is
+      # installed, host verification succeeds on validity alone and
+      # bootstrapThumbprint stops being consulted.
+      host: idrac01.example.com
+      port: 443
+      username: cert-publisher
+      auth:
+        secretRef:
+          name: idrac01-creds
+      # Trust on first use, for the run that happens before any trusted
+      # certificate exists. Get it with:
+      #   openssl s_client -connect idrac01.example.com:443 </dev/null 2>/dev/null \
+      #     | openssl x509 -noout -fingerprint -sha256
+      #
+      # Take this from a network path that is NOT TLS-inspected. Behind a
+      # TLS-inspecting proxy (Cloudflare Zero Trust, Netskope, Zscaler) you
+      # will capture the interceptor's certificate and pin that instead.
+      bootstrapThumbprint: "REPLACE_WITH_ENDPOINT_SHA256_THUMBPRINT"
+      # Optional PEM CA bundle for validating the live endpoint. When set it
+      # REPLACES the system trust store, so it must contain the CA that signs
+      # the published certificate (below, the "internal CA" that issuerRef
+      # points at).
+      # caBundle: |
+      #   -----BEGIN CERTIFICATE-----
+      #   ...internal CA...
+      #   -----END CERTIFICATE-----
+      #
+      # Importing a certificate restarts the iDRAC by itself, which is what
+      # applies it, so no explicit reset is configured here. Set
+      # forceResetAfterImport: true only for firmware that does not restart on
+      # import, which would otherwise leave the certificate inactive.

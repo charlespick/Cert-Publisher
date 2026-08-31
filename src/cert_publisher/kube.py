@@ -20,6 +20,10 @@ PLURAL = "certpublications"
 CM_GROUP = "cert-manager.io"
 CM_VERSION = "v1"
 CM_PLURAL = "certificates"
+# CertificateRequests are used by provisioners whose target host keeps its own
+# private key: there is no keypair for cert-manager to generate, only a CSR for
+# it to sign.
+CM_CR_PLURAL = "certificaterequests"
 
 
 class Kube:
@@ -59,6 +63,45 @@ class Kube:
         return self.custom.patch_namespaced_custom_object(
             CM_GROUP, CM_VERSION, namespace, CM_PLURAL, name, {"spec": spec}
         )
+
+    def get_certificate_request(self, namespace: str, name: str) -> dict | None:
+        try:
+            return self.custom.get_namespaced_custom_object(
+                CM_GROUP, CM_VERSION, namespace, CM_CR_PLURAL, name
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def create_certificate_request(self, namespace: str, body: dict) -> dict:
+        # Defensive: the reconciler records the request name on .status before
+        # creating it, so a duplicate create is not an expected path. Adopting
+        # on 409 keeps an unexpected one from wedging the publication forever.
+        try:
+            return self.custom.create_namespaced_custom_object(
+                CM_GROUP, CM_VERSION, namespace, CM_CR_PLURAL, body
+            )
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            name = body["metadata"]["name"]
+            log.info("adopting existing CertificateRequest %s/%s", namespace, name)
+            return self.custom.get_namespaced_custom_object(
+                CM_GROUP, CM_VERSION, namespace, CM_CR_PLURAL, name
+            )
+
+    def delete_certificate_request(self, namespace: str, name: str) -> None:
+        # A spent or rejected request is deleted so the next reconcile can
+        # create a fresh one: a CertificateRequest's spec is immutable, so it
+        # can never be retried in place.
+        try:
+            self.custom.delete_namespaced_custom_object(
+                CM_GROUP, CM_VERSION, namespace, CM_CR_PLURAL, name
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
 
     def patch_publication_status(self, namespace: str, name: str, status: dict) -> None:
         # Merge patch against the /status subresource: omitted fields are

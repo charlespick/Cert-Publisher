@@ -82,7 +82,7 @@ spec:
                   properties:
                     type:
                       type: string
-                      enum: [ssh, winrm]
+                      enum: [ssh, winrm, idrac8]
                     ssh:
                       type: object
                       required: [host, username, hostFingerprint, auth, certPath, keyPath]
@@ -123,6 +123,76 @@ spec:
                           default: "0600"
                         postInstallScript:
                           type: string
+                    idrac8:
+                      type: object
+                      required: [host, username, auth]
+                      description: >-
+                        Dell iDRAC8 (12th/13th-gen PowerEdge). The iDRAC will
+                        not accept an externally generated private key by any
+                        supported route, so it generates its own keypair and
+                        CSR and cert-manager signs it. No private key is sent
+                        to the host, and none of duration/renewBefore is
+                        delegated to cert-manager -- a signed CertificateRequest
+                        is never renewed, so cert-publisher owns renewal timing
+                        for this provisioner.
+                      properties:
+                        host:
+                          type: string
+                          description: >-
+                            Prefer the DNS name in the certificate: once a
+                            trusted certificate is installed, host verification
+                            succeeds on validity alone and bootstrapThumbprint
+                            stops being consulted.
+                        port:
+                          type: integer
+                          default: 443
+                        username:
+                          type: string
+                          description: >-
+                            An iDRAC user with Configure iDRAC privilege. Use a
+                            dedicated local account: Active Directory accounts
+                            are frequently rejected for API access on this
+                            generation.
+                        auth:
+                          type: object
+                          required: [secretRef]
+                          description: >-
+                            Login material. The referenced Secret (in this
+                            resource's namespace) supplies password.
+                          properties:
+                            secretRef:
+                              type: object
+                              required: [name]
+                              properties:
+                                name:
+                                  type: string
+                        bootstrapThumbprint:
+                          type: string
+                          description: >-
+                            Lowercase hex SHA-256 of the certificate the iDRAC
+                            serves today (colons optional), used to establish
+                            trust on first use before any trusted certificate
+                            exists. Ignored once the live certificate validates
+                            normally. Take it from a network path that is not
+                            TLS-inspected, or it will pin the interceptor.
+                        caBundle:
+                          type: string
+                          description: >-
+                            PEM CA bundle used to validate the live endpoint.
+                            When set it REPLACES the system trust store rather
+                            than adding to it, so it must contain the CA that
+                            signs the published certificate. A BMC has no public
+                            identity, so trusting every public CA would widen
+                            this check rather than tighten it.
+                        forceResetAfterImport:
+                          type: boolean
+                          default: false
+                          description: >-
+                            Issue an explicit iDRACReset after importing. Not
+                            normally needed: ImportSSLCertificate restarts the
+                            iDRAC by itself to apply the certificate. Enable
+                            only for firmware that does not, in which case the
+                            imported certificate would otherwise stay inactive.
                     winrm:
                       type: object
                       required: [host, username, thumbprint, auth]
@@ -232,6 +302,20 @@ spec:
                 publishedFingerprint:
                   type: string
                   description: SHA-256 fingerprint of the leaf last confirmed on the target.
+                lastSigningTime:
+                  type: string
+                  format: date-time
+                  description: >-
+                    When a signing round was last opened for a provisioner
+                    whose host keeps its own private key. Used to throttle a
+                    round that never converges, since each one rotates the
+                    host's key.
+                pendingRequestName:
+                  type: string
+                  description: >-
+                    CertificateRequest currently being signed for a provisioner
+                    whose host keeps its own private key. Set only while a
+                    signing round is in flight.
                 lastPublishedTime:
                   type: string
                   format: date-time

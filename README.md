@@ -145,6 +145,75 @@ passphrase) or the WinRM password. Host-identity values (`hostFingerprint`,
 
 See [`examples/`](examples/) for full manifests.
 
+### Dell iDRAC8 (PowerEdge 12G/13G)
+
+Publishes the iDRAC's web GUI certificate over WS-Man. **No private key is sent
+to the host.** An iDRAC8 will not accept an externally generated private key by
+any route this project can use -- Redfish on this generation has no certificate
+schema at all, its SSH is an SM-CLP/racadm interpreter with no SFTP, and
+`racadm sslkeyupload` exists only in the remote racadm binary -- so the BMC
+keeps its own key instead:
+
+1. The iDRAC generates a fresh keypair and a CSR.
+2. cert-manager signs the CSR through a `CertificateRequest`.
+3. The signed certificate is imported back. The iDRAC restarts by itself to
+   apply it -- that restart is part of the import, not a separate step.
+
+The private key never crosses the wire in either direction, which is a stronger
+position than shipping a PFX. The trade-off is renewal ownership: a
+`CertificateRequest` is signed once and never renewed, so **cert-publisher owns
+renewal timing for this provisioner** rather than cert-manager. It renews once
+the installed certificate is within `renewBefore` of expiry, defaulting to the
+final third of its lifetime -- and also whenever the installed certificate stops
+covering the publication's `dnsNames`, or is not the one cert-publisher last
+installed (which is what makes the first run against a factory certificate do
+the right thing).
+
+The "is this current?" check reads the certificate off the iDRAC's live TLS
+handshake -- the certificate clients actually see. That catches a host that has
+never been published to, one whose certificate has drifted from the
+publication's DNS names, one approaching expiry, and one where an import
+succeeded but the restart that applies it did not. It is the same
+handshake that authenticates the host, so a reconcile with nothing to do costs
+one TLS connection and sends no credentials at all.
+
+Host identity is established before any credential is sent, by either of two
+complementary signals, so a host moves from first setup to steady state with no
+configuration change:
+
+- **`bootstrapThumbprint`** -- SHA-256 of the certificate the iDRAC serves
+  today, for the first run against the factory self-signed certificate; or
+- **currently valid** -- the live certificate chains to a trusted CA, matches
+  the hostname, and is unexpired. `caBundle`, when set, *replaces* the system
+  trust store rather than adding to it: a BMC has no public identity, so
+  trusting every public CA would widen the check rather than tighten it. Set it
+  to the CA that signs the published certificate.
+
+Whichever signal accepts the host, the hash of *that exact certificate* is then
+pinned onto the connection carrying the WS-Man session, so a man-in-the-middle
+cannot satisfy the check on one connection and serve the session on another.
+
+Standard certificate validation rules apply to the second signal, expiry
+included, and that is deliberate: **an iDRAC whose certificate has already
+expired cannot be renewed unattended.** Renewal starts well before expiry, so
+reaching that state means the host was unreachable or failing for most of a
+certificate lifetime -- in which case an operator should look at it rather than
+have cert-publisher accept an expired credential as proof of identity. Recovery
+is to set `bootstrapThumbprint` to what the host is serving now, exactly as on
+first run. This mirrors how MDM and other PKI-based enrolment systems treat an
+expired device credential.
+
+> **Derive `bootstrapThumbprint` from a path that is not TLS-inspected.** Run
+> from a workstation behind Cloudflare Zero Trust, Netskope, Zscaler or similar,
+> `openssl s_client` shows you the proxy's certificate, and you would pin that
+> instead of the iDRAC's.
+
+Note that the iDRAC reboots to apply a new certificate, which drops active
+iKVM and virtual media sessions. The host OS is unaffected.
+
+The WS-Man calls follow Dell's iDRAC Card Profile (DCIM1043): `SetAttributes`
+to stage the CSR subject, `GenerateSSLCSR`, then `ImportSSLCertificate`.
+
 ## Deploying
 
 Cert-Publisher ships as a Helm chart, published to GHCR as an OCI artifact.

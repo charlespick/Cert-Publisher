@@ -40,9 +40,9 @@ from pypsrp.complex_objects import Color, Coordinates, CultureInfo, ObjectMeta, 
 from pypsrp.host import PSHost, PSHostRawUserInterface, PSHostUserInterface
 from pypsrp.powershell import DEFAULT_CONFIGURATION_NAME, PowerShell, RunspacePool
 from pypsrp.wsman import SUPPORTED_AUTHS, WSMan
-from requests.adapters import HTTPAdapter
 
 from ..retry import with_retries
+from ..tlspin import PinnedHTTPAdapter as _PinnedHTTPAdapter
 from ..utils import sha1_thumbprint
 from .base import Credentials, Provisioner, resolve_credentials
 
@@ -188,36 +188,6 @@ def _unattended_host() -> PSHost:
         ui=_UnattendedUI(raw_ui=raw_ui),
         version="1.0.0",
     )
-
-
-class _PinnedHTTPAdapter(HTTPAdapter):
-    """A ``requests`` adapter that pins the TLS peer to a certificate thumbprint.
-
-    pypsrp is run with certificate validation disabled -- a WinRM listener's
-    self-signed cert chains to no CA -- so urllib3 would otherwise accept any
-    certificate on the connection that carries the auth exchange, the PFX and
-    the command output. This adapter re-adds the check that matters: every
-    connection urllib3 takes from the pool must present a leaf certificate
-    whose SHA-1 hash equals ``thumbprint`` (urllib3 accepts the value with or
-    without colons and in any case), or the socket is refused before a single
-    request byte is written. The check runs on the pooled connection itself,
-    so -- unlike a standalone probe -- it cannot be satisfied by one connection
-    while the session data rides another.
-    """
-
-    def __init__(self, thumbprint: str, **kwargs) -> None:
-        self._assert_fingerprint = thumbprint
-        super().__init__(**kwargs)
-
-    def init_poolmanager(self, *args, **kwargs) -> None:
-        kwargs["assert_fingerprint"] = self._assert_fingerprint
-        kwargs["cert_reqs"] = "CERT_NONE"
-        super().init_poolmanager(*args, **kwargs)
-
-    def proxy_manager_for(self, *args, **kwargs):
-        kwargs["assert_fingerprint"] = self._assert_fingerprint
-        kwargs["cert_reqs"] = "CERT_NONE"
-        return super().proxy_manager_for(*args, **kwargs)
 
 
 def _error_text(powershell: PowerShell) -> str:
