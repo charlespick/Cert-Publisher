@@ -69,7 +69,7 @@ spec:
       #   ...internal CA...
       #   -----END CERTIFICATE-----
       #
-      # Importing a certificate restarts the iDRAC by itself, which is what
-      # applies it, so no explicit reset is configured here. Set
-      # forceResetAfterImport: true only for firmware that does not restart on
-      # import, which would otherwise leave the certificate inactive.
+      # The iDRAC keeps serving the old certificate until it is reset, so the
+      # reset is part of the install. Disabling it leaves each imported
+      # certificate inactive until the iDRAC is reset by other means.
+      reset: true

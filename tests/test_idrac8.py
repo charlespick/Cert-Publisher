@@ -144,7 +144,7 @@ def _provisioner(**kw):
         "credentials": Credentials(password="pw"),
         "bootstrap_thumbprint": None,
         "ca_bundle": None,
-        "force_reset": False,
+        "reset": True,
     }
     defaults.update(kw)
     return IDRAC8Provisioner(**defaults)
@@ -494,14 +494,16 @@ def test_generate_csr_raises_when_no_csr_comes_back(monkeypatch):
         prov.generate_csr(common_name="a", dns_names=["a"])
 
 
-def test_import_certificate_base64s_the_payload(monkeypatch):
+def test_import_sends_raw_pem_not_base64(monkeypatch):
+    """PEM is already base64-armoured; wrapping it again is rejected."""
     pem = _cert()
     client = _RecordingClient({})
     prov = _provisioner()
     monkeypatch.setattr(prov, "_connect", lambda: client)
     prov.import_certificate(pem)
     params = client.calls[0][1]
-    assert base64.b64decode(params["SSLCertificateFile"]) == pem
+    assert params["SSLCertificateFile"] == pem.decode()
+    assert params["SSLCertificateFile"].startswith("-----BEGIN CERTIFICATE-----")
     # Import takes CertificateType; only Export takes SSLCertType (DCIM1043).
     assert params["CertificateType"] == "1"
     assert "SSLCertType" not in params
@@ -518,26 +520,26 @@ def test_import_sends_only_the_leaf_not_the_issuing_chain(monkeypatch):
     monkeypatch.setattr(prov, "_connect", lambda: client)
     prov.import_certificate(bundle)
 
-    sent = base64.b64decode(client.calls[0][1]["SSLCertificateFile"])
-    assert sent == leaf
-    assert sent.count(b"BEGIN CERTIFICATE") == 1
+    sent = client.calls[0][1]["SSLCertificateFile"]
+    assert sent == leaf.decode()
+    assert sent.count("BEGIN CERTIFICATE") == 1
 
 
-def test_import_does_not_reset_because_the_import_already_restarts(monkeypatch):
-    """DCIM1043 8.9: the iDRAC restarts itself on import. A second reset is waste."""
+def test_import_resets_the_idrac_to_apply_the_certificate(monkeypatch):
+    """Firmware 2.86.86.86 answers DH010: the cert is inactive until reset."""
     client = _RecordingClient({})
     prov = _provisioner()
     monkeypatch.setattr(prov, "_connect", lambda: client)
     prov.import_certificate(_cert())
-    assert [m for m, _ in client.calls] == ["ImportSSLCertificate"]
+    assert [m for m, _ in client.calls] == ["ImportSSLCertificate", "iDRACReset"]
 
 
-def test_force_reset_adds_an_explicit_reset_for_firmware_that_needs_it(monkeypatch):
+def test_reset_can_be_disabled(monkeypatch):
     client = _RecordingClient({})
-    prov = _provisioner(force_reset=True)
+    prov = _provisioner(reset=False)
     monkeypatch.setattr(prov, "_connect", lambda: client)
     prov.import_certificate(_cert())
-    assert [m for m, _ in client.calls] == ["ImportSSLCertificate", "iDRACReset"]
+    assert [m for m, _ in client.calls] == ["ImportSSLCertificate"]
 
 
 # -- renewal policy --------------------------------------------------------
@@ -783,7 +785,7 @@ def test_build_provisioner_constructs_idrac8():
     )
     assert isinstance(prov, IDRAC8Provisioner)
     assert prov.bootstrap_thumbprint == "abcd"
-    assert prov.force_reset is False
+    assert prov.reset is True
 
 
 # -- review follow-ups: transport hardening --------------------------------

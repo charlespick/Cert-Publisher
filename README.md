@@ -156,8 +156,8 @@ keeps its own key instead:
 
 1. The iDRAC generates a fresh keypair and a CSR.
 2. cert-manager signs the CSR through a `CertificateRequest`.
-3. The signed certificate is imported back. The iDRAC restarts by itself to
-   apply it -- that restart is part of the import, not a separate step.
+3. The signed certificate is imported back and the iDRAC is reset, which is
+   what makes the new certificate take effect.
 
 The private key never crosses the wire in either direction, which is a stronger
 position than shipping a PFX. The trade-off is renewal ownership: a

@@ -36,7 +36,6 @@ cannot satisfy the check on one connection and serve the session on another.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import logging
 import socket
@@ -101,7 +100,7 @@ class IDRAC8Provisioner(CsrProvisioner):
         credentials: Credentials,
         bootstrap_thumbprint: str | None,
         ca_bundle: str | None,
-        force_reset: bool,
+        reset: bool,
     ) -> None:
         self.host = host
         self.port = port
@@ -111,7 +110,7 @@ class IDRAC8Provisioner(CsrProvisioner):
             _normalise_thumbprint(bootstrap_thumbprint) if bootstrap_thumbprint else None
         )
         self.ca_bundle = ca_bundle
-        self.force_reset = force_reset
+        self.reset = reset
 
     @classmethod
     def from_spec(cls, spec: dict, kube, namespace: str) -> IDRAC8Provisioner:
@@ -122,7 +121,7 @@ class IDRAC8Provisioner(CsrProvisioner):
             credentials=resolve_credentials(spec.get("auth", {}), kube, namespace),
             bootstrap_thumbprint=spec.get("bootstrapThumbprint"),
             ca_bundle=spec.get("caBundle"),
-            force_reset=bool(spec.get("forceResetAfterImport", False)),
+            reset=bool(spec.get("reset", True)),
         )
 
     # -- host authentication ---------------------------------------------
@@ -333,20 +332,21 @@ class IDRAC8Provisioner(CsrProvisioner):
         return (csr + "\n").encode()
 
     def import_certificate(self, cert_pem: bytes) -> None:
-        """Import the signed certificate; the iDRAC restarts itself to apply it."""
-        # Leaf only. CertificateType 1 is the single web-server certificate
-        # slot -- Dell's type 2 is the Directory Service CA, not a chain slot --
-        # and an issuer may return leaf + intermediates in one PEM. Sending the
-        # bundle risks the import failing outright, and every other comparison
-        # in this operator (publishedFingerprint, the handshake read) is already
-        # leaf-only, so this keeps what we install identical to what we compare.
+        """Install the signed certificate and reset the iDRAC to apply it."""
+        # Raw PEM, NOT base64-of-PEM. Dell describes SSLCertificateFile as "a
+        # base 64 encoded string of the ... Certificate file" (DCIM1043 8.9),
+        # which means the PEM text -- PEM is already base64-armoured.
+        # Base64-wrapping it a second time is rejected with the unhelpful
+        # "Certificate import operation failed". ExportSSLCertificate returns
+        # raw PEM, and import is its mirror image.
         #
-        # "A base 64 encoded string of the ... Certificate file" (DCIM1043 8.9).
-        # leaf_pem() drops the block's trailing newline; re-terminate so the
-        # iDRAC receives a well-formed PEM block.
-        payload = base64.b64encode(leaf_pem(cert_pem) + b"\n").decode()
+        # Leaf only: CertificateType 1 is the single web-server certificate
+        # slot (Dell's type 2 is the Directory Service CA, not a chain slot),
+        # and an ACME issuer returns leaf + intermediates in one PEM.
+        payload = (leaf_pem(cert_pem) + b"\n").decode()
+
         with self._connect() as client:
-            client.invoke(
+            output = client.invoke(
                 _SERVICE,
                 "ImportSSLCertificate",
                 {
@@ -354,20 +354,23 @@ class IDRAC8Provisioner(CsrProvisioner):
                     "CertificateType": _CERT_TYPE_SERVER,
                 },
             )
-            # "After importing the certificate, the iDRAC will automatically
-            # restart" (DCIM1043 8.9), which is also what its own success
-            # message LC077 says. So the reset that applies the certificate is
-            # part of the import; issuing another one would reboot the BMC a
-            # second time for nothing.
-            log.info(
-                "[%s] certificate imported; the iDRAC restarts to apply it",
-                self.host,
-            )
+            log.info("[%s] certificate imported: %s", self.host,
+                     output.get("Message", "no detail"))
 
-            if self.force_reset:
-                # Escape hatch for firmware that does not self-restart. The
-                # reconciler notices either way: the next run reads the live
-                # handshake, and a certificate that never took effect shows up
-                # as still needing renewal.
-                log.info("[%s] forcing an additional iDRAC reset", self.host)
-                client.invoke(_SERVICE, "iDRACReset", {"Force": "0"})
+            if not self.reset:
+                log.warning(
+                    "[%s] reset is disabled; the imported certificate stays "
+                    "inactive until the iDRAC is reset by other means",
+                    self.host,
+                )
+                return
+
+            # An iDRAC8 keeps serving the previous certificate until it is
+            # reset, so the import is only half the job. Dell's profile claims
+            # the import restarts the iDRAC by itself, but firmware 2.86.86.86
+            # answers DH010 -- "Reset iDRAC to apply new certificate. Until
+            # iDRAC is reset, the old certificate will be active" -- so the
+            # reset is issued explicitly and the documentation is not trusted
+            # on this point.
+            log.info("[%s] resetting the iDRAC to apply the certificate", self.host)
+            client.invoke(_SERVICE, "iDRACReset", {"Force": "0"})

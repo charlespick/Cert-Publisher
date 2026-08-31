@@ -184,15 +184,19 @@ spec:
                             signs the published certificate. A BMC has no public
                             identity, so trusting every public CA would widen
                             this check rather than tighten it.
-                        forceResetAfterImport:
+                        reset:
                           type: boolean
-                          default: false
+                          default: true
                           description: >-
-                            Issue an explicit iDRACReset after importing. Not
-                            normally needed: ImportSSLCertificate restarts the
-                            iDRAC by itself to apply the certificate. Enable
-                            only for firmware that does not, in which case the
-                            imported certificate would otherwise stay inactive.
+                            Reset the iDRAC after importing, which is what makes
+                            the new certificate take effect. Firmware 2.86.86.86
+                            answers an import with "Reset iDRAC to apply new
+                            certificate. Until iDRAC is reset, the old
+                            certificate will be active", so this is required in
+                            practice despite Dell's profile claiming the import
+                            restarts the iDRAC on its own. Disabling it leaves
+                            each imported certificate inactive until the iDRAC
+                            is reset by other means.
                     winrm:
                       type: object
                       required: [host, username, thumbprint, auth]
