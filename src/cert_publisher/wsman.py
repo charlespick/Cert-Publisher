@@ -33,6 +33,7 @@ _WSMAN = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
 DELL_SCHEMA = "http://schemas.dell.com/wbem/wscim/1/cim-schema/2/"
 
 _ANONYMOUS = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
+_GET_ACTION = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get"
 
 # DCIM methods answer with a ReturnValue rather than a SOAP fault for
 # domain-level failures. 0 is success; 4096 means "job created, poll it".
@@ -86,6 +87,78 @@ class WSManClient:
 
     # -- request construction --------------------------------------------
 
+    def _wrap(self, action: str, resource_uri: str, selectors: dict, body: str) -> str:
+        selector_xml = "".join(
+            f"<wsman:Selector Name={quoteattr(k)}>{escape(v)}</wsman:Selector>"
+            for k, v in selectors.items()
+        )
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            f'<s:Envelope xmlns:s="{_SOAP}" xmlns:wsa="{_WSA}" xmlns:wsman="{_WSMAN}">'
+            "<s:Header>"
+            f"<wsa:To>{escape(self.url)}</wsa:To>"
+            f"<wsman:ResourceURI>{escape(resource_uri)}</wsman:ResourceURI>"
+            f"<wsa:ReplyTo><wsa:Address>{_ANONYMOUS}</wsa:Address></wsa:ReplyTo>"
+            f"<wsa:Action>{escape(action)}</wsa:Action>"
+            f"<wsa:MessageID>uuid:{uuid.uuid4()}</wsa:MessageID>"
+            '<wsman:MaxEnvelopeSize s:mustUnderstand="true">512000</wsman:MaxEnvelopeSize>'
+            f"<wsman:OperationTimeout>PT{self.timeout}.000S</wsman:OperationTimeout>"
+            f"<wsman:SelectorSet>{selector_xml}</wsman:SelectorSet>"
+            "</s:Header>"
+            f"<s:Body>{body}</s:Body>"
+            "</s:Envelope>"
+        )
+
+    def get(self, cim_class: str, selectors: dict) -> dict[str, str]:
+        """Fetch one CIM instance addressed by ``selectors``.
+
+        Used to read an iDRAC attribute's CurrentValue/PendingValue directly,
+        which is cheaper and far simpler than an Enumerate/Pull sweep of every
+        attribute on the card.
+        """
+        resource_uri = DELL_SCHEMA + cim_class
+        root = self._send(
+            self._wrap(_GET_ACTION, resource_uri, selectors, ""),
+            f"{cim_class} Get",
+        )
+        fields: dict[str, str] = {}
+        for element in root.iter():
+            if element.tag.split("}")[-1] != cim_class:
+                continue
+            for child in element:
+                fields[child.tag.split("}")[-1]] = (child.text or "").strip()
+        return fields
+
+    def _send(self, envelope: str, what: str) -> ET.Element:
+        """POST one envelope and return its parsed body, raising on failure."""
+        response = self.session.post(
+            self.url,
+            data=envelope.encode("utf-8"),
+            timeout=self.timeout + 10,
+            # A SOAP endpoint has no legitimate redirect, and following one
+            # would carry the Basic credentials over an unpinned (possibly
+            # plaintext) connection, since the pin is mounted on https:// only.
+            allow_redirects=False,
+        )
+        # An iDRAC reports domain failures as HTTP 500 with a SOAP fault body,
+        # so the fault is parsed before the status code is judged: it carries
+        # the only actionable text (InvalidParameter, AccessDenied, "method not
+        # supported"). Falling through to a bare status code would discard it.
+        root = None
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError:
+            pass
+        if root is not None and (fault := _fault_text(root)) is not None:
+            raise WSManError(f"{what} on {self.host} faulted: {fault}")
+        if response.status_code != 200:
+            raise WSManError(
+                f"{what} on {self.host} returned HTTP {response.status_code}"
+            )
+        if root is None:
+            raise WSManError(f"{what} on {self.host} returned an unparseable body")
+        return root
+
     def _envelope(
         self, resource_uri: str, method: str, params: dict, selectors: dict
     ) -> str:
@@ -136,36 +209,7 @@ class WSManClient:
         envelope = self._envelope(resource_uri, method, params or {}, selectors)
 
         log.debug("wsman invoke %s.%s on %s", cim_class, method, self.host)
-        response = self.session.post(
-            self.url,
-            data=envelope.encode("utf-8"),
-            timeout=self.timeout + 10,
-            # A SOAP endpoint has no legitimate redirect, and following one
-            # would carry the Basic credentials over an unpinned (possibly
-            # plaintext) connection, since the pin is mounted on https:// only.
-            allow_redirects=False,
-        )
-
-        # An iDRAC reports domain failures as HTTP 500 with a SOAP fault body,
-        # so the fault is parsed before the status code is judged: it carries
-        # the only actionable text (InvalidParameter, AccessDenied, "method not
-        # supported"). Falling through to a bare status code would discard it.
-        root = None
-        try:
-            root = ET.fromstring(response.content)
-        except ET.ParseError:
-            pass
-        if root is not None and (fault := _fault_text(root)) is not None:
-            raise WSManError(f"{cim_class}.{method} on {self.host} faulted: {fault}")
-        if response.status_code != 200:
-            raise WSManError(
-                f"{cim_class}.{method} on {self.host} returned HTTP "
-                f"{response.status_code}"
-            )
-        if root is None:
-            raise WSManError(
-                f"{cim_class}.{method} on {self.host} returned an unparseable body"
-            )
+        root = self._send(envelope, f"{cim_class}.{method}")
 
         output = _output_fields(root, method)
         if expect_return:

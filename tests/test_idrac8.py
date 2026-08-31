@@ -82,12 +82,30 @@ class _FakeKube:
         return None
 
 
+def _csr(cn="idrac01.example.com", key_usage=True) -> bytes:
+    """A real CSR shaped like the one an iDRAC8 emits."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    builder = x509.CertificateSigningRequestBuilder().subject_name(
+        x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    )
+    if key_usage:
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=True, key_encipherment=True,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ),
+            critical=False,
+        )
+    return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+
+
 class _FakeProv:
     """Stands in for IDRAC8Provisioner at the reconcile boundary."""
 
-    def __init__(self, installed=None, csr=b"-----BEGIN CERTIFICATE REQUEST-----\nx\n-----END CERTIFICATE REQUEST-----\n"):
+    def __init__(self, installed=None, csr=None):
         self.installed = installed
-        self.csr = csr
+        self.csr = csr if csr is not None else _csr()
         self.imported = None
         self.csr_args = None
 
@@ -331,9 +349,17 @@ def test_connect_requires_a_password(monkeypatch):
 
 
 class _RecordingClient:
-    def __init__(self, outputs):
+    def __init__(self, outputs, attributes=None):
         self.outputs = outputs
         self.calls = []
+        # InstanceID suffix -> CurrentValue, as WSManClient.get would report.
+        self.attributes = attributes if attributes is not None else {}
+        self.gets = []
+
+    def get(self, cim_class, selectors):
+        instance = selectors["InstanceID"]
+        self.gets.append(instance)
+        return {"CurrentValue": self.attributes.get(instance.split("#", 1)[1], "")}
 
     def __enter__(self):
         return self
@@ -386,25 +412,82 @@ def test_installed_certificate_propagates_an_unreachable_host(monkeypatch):
         prov.installed_certificate()
 
 
-def test_generate_csr_sets_subject_then_generates(monkeypatch):
-    client = _RecordingClient({"GenerateSSLCSR": {"SSLCSRFile": "CSRDATA"}})
+def test_generate_csr_applies_the_subject_then_generates(monkeypatch):
+    """SetAttributes only stages; a config job commits it before the CSR."""
+    applied = {}
+
+    class _Client(_RecordingClient):
+        def invoke(self, cim_class, method, params=None, **kw):
+            out = super().invoke(cim_class, method, params, **kw)
+            if method == "CreateTargetedConfigJob":
+                # The job is what makes the staged values current.
+                self.attributes.update(applied)
+            return out
+
+    client = _Client({"GenerateSSLCSR": {"SSLCSRFile": "CSRDATA"}}, attributes={})
+    applied.update({
+        "Security.1#CsrCommonName": "a.example.com",
+        "Security.1#CsrSubjectAltName": "a.example.com,b.example.com",
+    })
     prov = _provisioner()
     monkeypatch.setattr(prov, "_connect", lambda: client)
-    csr = prov.generate_csr(common_name="a.example.com", dns_names=["a.example.com", "b.example.com"])
+
+    csr = prov.generate_csr(
+        common_name="a.example.com", dns_names=["a.example.com", "b.example.com"]
+    )
+
     assert csr == b"CSRDATA\n"
     methods = [m for m, _ in client.calls]
-    assert methods == ["SetAttributes", "GenerateSSLCSR"]
+    assert methods == ["SetAttributes", "CreateTargetedConfigJob", "GenerateSSLCSR"]
     attrs = client.calls[0][1]
     assert attrs["Target"] == "iDRAC.Embedded.1"
-    assert attrs["AttributeValue"] == ["a.example.com", "a.example.com,b.example.com"]
     # SetAttributes wants "<GroupID>#<AttributeName>", not the dotted form.
     assert attrs["AttributeName"] == [
         "Security.1#CsrCommonName", "Security.1#CsrSubjectAltName",
     ]
+    assert attrs["AttributeValue"] == ["a.example.com", "a.example.com,b.example.com"]
+
+
+def test_generate_csr_skips_the_config_job_when_the_subject_already_matches(monkeypatch):
+    """Steady-state renewals must not run a job on every round."""
+    client = _RecordingClient(
+        {"GenerateSSLCSR": {"SSLCSRFile": "CSRDATA"}},
+        attributes={
+            "Security.1#CsrCommonName": "a.example.com",
+            "Security.1#CsrSubjectAltName": "a.example.com",
+        },
+    )
+    prov = _provisioner()
+    monkeypatch.setattr(prov, "_connect", lambda: client)
+
+    prov.generate_csr(common_name="a.example.com", dns_names=["a.example.com"])
+
+    assert [m for m, _ in client.calls] == ["GenerateSSLCSR"]
+
+
+def test_generate_csr_refuses_when_the_subject_never_applies(monkeypatch):
+    """A CSR minted from a stale subject is what a public CA then refuses."""
+    # The job never makes the staged values current.
+    client = _RecordingClient({"GenerateSSLCSR": {"SSLCSRFile": "X"}}, attributes={})
+    prov = _provisioner()
+    monkeypatch.setattr(prov, "_connect", lambda: client)
+    monkeypatch.setattr("cert_publisher.provisioners.idrac8._APPLY_TIMEOUT", 0)
+    monkeypatch.setattr("cert_publisher.provisioners.idrac8._APPLY_POLL_INTERVAL", 0)
+
+    with pytest.raises(RuntimeError, match="did not apply the CSR subject"):
+        prov.generate_csr(common_name="a.example.com", dns_names=["a.example.com"])
+
+    assert "GenerateSSLCSR" not in [m for m, _ in client.calls]
 
 
 def test_generate_csr_raises_when_no_csr_comes_back(monkeypatch):
-    client = _RecordingClient({"GenerateSSLCSR": {}})
+    client = _RecordingClient(
+        {"GenerateSSLCSR": {}},
+        attributes={
+            "Security.1#CsrCommonName": "a",
+            "Security.1#CsrSubjectAltName": "a",
+        },
+    )
     prov = _provisioner()
     monkeypatch.setattr(prov, "_connect", lambda: client)
     with pytest.raises(RuntimeError, match="returned no SSLCSRFile"):
@@ -524,9 +607,10 @@ def test_renewal_reason_flags_expiry():
 
 
 def test_build_certificate_request_body():
-    body = build_certificate_request_body(_pub(duration="2160h"), "idrac01-abc", b"CSR")
+    csr = _csr()
+    body = build_certificate_request_body(_pub(duration="2160h"), "idrac01-abc", csr)
     assert body["kind"] == "CertificateRequest"
-    assert body["spec"]["request"] == base64.b64encode(b"CSR").decode()
+    assert body["spec"]["request"] == base64.b64encode(csr).decode()
     assert body["spec"]["duration"] == "2160h"
     assert body["spec"]["isCA"] is False
     assert "renewBefore" not in body["spec"]
@@ -954,3 +1038,57 @@ def test_the_cooldown_message_does_not_claim_an_import_happened(monkeypatch):
     message = kube.status["message"]
     assert "signing round started" in message
     assert "was signed and imported" not in message
+
+
+# -- first contact with real hardware --------------------------------------
+
+
+def test_key_usages_come_from_the_csr_not_the_publication():
+    """cert-manager demands the declared key usages match the CSR exactly."""
+    from cert_publisher.certmanager import csr_key_usages
+
+    # An iDRAC8 encodes contentCommitment, which no publication here declares.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "h.example.com")]))
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=True, key_encipherment=True,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
+    assert csr_key_usages(csr) == [
+        "digital signature", "content commitment", "key encipherment",
+    ]
+
+    body = build_certificate_request_body(
+        _pub(usages=["server auth", "digital signature", "key encipherment"]),
+        "n", csr,
+    )
+    # Key usages replaced by the CSR's; the extended key usage carried through.
+    assert body["spec"]["usages"] == [
+        "digital signature", "content commitment", "key encipherment", "server auth",
+    ]
+
+
+def test_a_csr_without_key_usages_falls_back_to_the_publication():
+    from cert_publisher.certmanager import csr_key_usages
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "h.example.com")]))
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
+    assert csr_key_usages(csr) == []
+    body = build_certificate_request_body(_pub(usages=["server auth"]), "n", csr)
+    assert body["spec"]["usages"] == ["server auth"]
+
+

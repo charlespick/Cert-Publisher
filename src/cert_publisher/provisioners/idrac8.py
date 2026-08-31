@@ -41,6 +41,7 @@ import hashlib
 import logging
 import socket
 import ssl
+import time
 
 from ..retry import with_retries
 from ..utils import leaf_pem
@@ -62,12 +63,25 @@ _SERVICE = "DCIM_iDRACCardService"
 _CERT_TYPE_SERVER = "1"
 
 # GenerateSSLCSR takes no parameters -- the iDRAC builds the CSR from these
-# stored attributes -- so they are set immediately before it is invoked.
-# SetAttributes expects each name as "<GroupID>#<AttributeName>" with a HASH
-# separator, not the dotted form the attributes are enumerated under (Dell
-# iDRAC Card Profile, DCIM1043, section 8.4).
+# stored attributes -- so they are set before it is invoked. SetAttributes
+# expects each name as "<GroupID>#<AttributeName>" with a HASH separator, not
+# the dotted form the attributes are enumerated under (Dell iDRAC Card Profile,
+# DCIM1043, section 8.4).
 _ATTR_COMMON_NAME = "Security.1#CsrCommonName"
 _ATTR_SUBJECT_ALT_NAME = "Security.1#CsrSubjectAltName"
+
+# The class those attributes live on, and the InstanceID form addressing one of
+# them: "<FQDD>#<GroupID>#<AttributeName>".
+_ATTR_CLASS = "DCIM_iDRACCardString"
+_TARGET = "iDRAC.Embedded.1"
+
+# SetAttributes stores a *pending* value; GenerateSSLCSR reads the *current*
+# one. Without a config job in between, a CSR is minted from the previous
+# subject -- which is how an iDRAC's stale IP SAN ends up in a CSR that a public
+# CA then refuses to sign. The job is real-time for these attributes (the iDRAC
+# reports RebootRequired: No), so it costs a few seconds and no restart.
+_APPLY_TIMEOUT = 90
+_APPLY_POLL_INTERVAL = 3
 
 _TIMEOUT = 60
 _CONNECT_TIMEOUT = 15
@@ -236,25 +250,76 @@ class IDRAC8Provisioner(CsrProvisioner):
             return None
         return ssl.DER_cert_to_PEM_cert(der).encode()
 
+    def _attribute(self, client: WSManClient, attribute: str) -> dict[str, str]:
+        """Read one iDRAC attribute, including its pending value."""
+        return client.get(
+            _ATTR_CLASS, {"InstanceID": f"{_TARGET}#{attribute}"}
+        )
+
+    def _apply_csr_subject(self, client: WSManClient, desired: dict[str, str]) -> None:
+        """Make the stored CSR subject match ``desired``, or raise trying.
+
+        SetAttributes only stages the values, so a config job commits them and
+        the result is confirmed by reading CurrentValue back -- the attribute
+        itself is the thing that matters, and it is a more direct answer than
+        interpreting a job status.
+        """
+        names = list(desired)
+        client.invoke(
+            _SERVICE,
+            "SetAttributes",
+            {
+                "Target": _TARGET,
+                "AttributeName": names,
+                "AttributeValue": [desired[n] for n in names],
+            },
+        )
+        log.info("[%s] applying the CSR subject", self.host)
+        client.invoke(
+            _SERVICE,
+            "CreateTargetedConfigJob",
+            {"Target": _TARGET, "ScheduledStartTime": "TIME_NOW"},
+        )
+
+        deadline = time.monotonic() + _APPLY_TIMEOUT
+        while True:
+            current = {n: self._attribute(client, n).get("CurrentValue", "") for n in names}
+            if current == desired:
+                log.debug("[%s] CSR subject applied", self.host)
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"iDRAC {self.host} did not apply the CSR subject within "
+                    f"{_APPLY_TIMEOUT}s (wanted {desired}, still {current}). "
+                    f"A CSR generated now would carry the previous subject, so "
+                    f"none was requested."
+                )
+            time.sleep(_APPLY_POLL_INTERVAL)
+
     def generate_csr(self, *, common_name: str, dns_names: list[str]) -> bytes:
         """Rotate the iDRAC's keypair and return the PEM CSR it emits.
 
-        The iDRAC builds the CSR from its stored ``Security.1.Csr*`` attributes,
-        so the subject and SANs are written first. Only the common name and SAN
-        list are set: the remaining fields (organization, locality, key size)
-        are left as configured on the BMC rather than being clobbered with
-        defaults this operator would have to invent.
+        The iDRAC builds the CSR from its stored ``Security.1#Csr*`` attributes,
+        so the subject and SANs are made to match the publication first. Only
+        the common name and SAN list are managed: the remaining fields
+        (organization, locality, key size) are left as configured on the BMC
+        rather than being clobbered with defaults this operator would invent.
         """
+        desired = {
+            _ATTR_COMMON_NAME: common_name,
+            _ATTR_SUBJECT_ALT_NAME: ",".join(dns_names),
+        }
         with self._connect() as client:
-            client.invoke(
-                _SERVICE,
-                "SetAttributes",
-                {
-                    "Target": "iDRAC.Embedded.1",
-                    "AttributeName": [_ATTR_COMMON_NAME, _ATTR_SUBJECT_ALT_NAME],
-                    "AttributeValue": [common_name, ",".join(dns_names)],
-                },
-            )
+            current = {
+                n: self._attribute(client, n).get("CurrentValue", "") for n in desired
+            }
+            if current == desired:
+                # Steady state: nothing to change, so no config job runs and
+                # renewals stay a single generate-and-sign round.
+                log.debug("[%s] CSR subject already matches the publication", self.host)
+            else:
+                self._apply_csr_subject(client, desired)
+
             log.info("[%s] generating a new CSR (this rotates the iDRAC's key)",
                      self.host)
             output = client.invoke(_SERVICE, "GenerateSSLCSR", {})

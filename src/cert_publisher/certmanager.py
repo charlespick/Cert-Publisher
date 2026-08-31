@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 
+from cryptography import x509
+
 from .kube import CM_GROUP, CM_VERSION, GROUP, VERSION
 
 # Fields we pass straight through from the CertPublication spec to the
@@ -73,6 +75,51 @@ def certificate_spec_drift(existing: dict, pub: dict, secret_name: str) -> dict 
     return desired
 
 
+# cert-manager key-usage names, by the cryptography KeyUsage attribute that
+# encodes them. Only the key usages appear here: extended key usages cannot be
+# derived from a CSR that carries no EKU extension, so those still come from the
+# publication.
+_KEY_USAGE_NAMES = (
+    ("digital_signature", "digital signature"),
+    ("content_commitment", "content commitment"),
+    ("key_encipherment", "key encipherment"),
+    ("data_encipherment", "data encipherment"),
+    ("key_agreement", "key agreement"),
+    ("key_cert_sign", "cert sign"),
+    ("crl_sign", "crl sign"),
+)
+
+# Everything in spec.usages that is NOT a key usage, i.e. the extended key
+# usages, which are carried through from the publication unchanged.
+_KEY_USAGE_VALUES = frozenset(name for _, name in _KEY_USAGE_NAMES) | {"signing"}
+
+
+def csr_key_usages(csr_pem: bytes) -> list[str]:
+    """The cert-manager key-usage names encoded in a CSR's keyUsage extension.
+
+    cert-manager refuses a CertificateRequest whose declared key usages differ
+    at all from the ones the CSR actually encodes. When the CSR comes from the
+    host rather than from us, the host decides -- so the usages have to be read
+    off the CSR instead of asserted from the publication.
+    """
+    csr = x509.load_pem_x509_csr(csr_pem)
+    try:
+        key_usage = csr.extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound:
+        return []
+
+    usages = []
+    for attribute, name in _KEY_USAGE_NAMES:
+        try:
+            if getattr(key_usage, attribute):
+                usages.append(name)
+        except ValueError:
+            # encipher_only/decipher_only raise unless key_agreement is set;
+            # the attributes read here never do, but stay defensive.
+            continue
+    return usages
+
+
 def build_certificate_request_body(pub: dict, name: str, csr_pem: bytes) -> dict:
     """Build a cert-manager CertificateRequest that signs a host-generated CSR.
 
@@ -86,14 +133,21 @@ def build_certificate_request_body(pub: dict, name: str, csr_pem: bytes) -> dict
     meta = pub["metadata"]
     spec = pub["spec"]
 
+    # Key usages are read from the CSR because the host encoded them and
+    # cert-manager demands an exact match; extended key usages (server auth and
+    # friends) are not in the CSR, so those still come from the publication.
+    extended = [u for u in spec.get("usages", []) if u not in _KEY_USAGE_VALUES]
+    usages = csr_key_usages(csr_pem) + extended
+
     request_spec: dict = {
         "request": base64.b64encode(csr_pem).decode(),
         "issuerRef": spec["issuerRef"],
         "isCA": False,
     }
-    for key in ("duration", "usages"):
-        if key in spec:
-            request_spec[key] = spec[key]
+    if usages:
+        request_spec["usages"] = usages
+    if "duration" in spec:
+        request_spec["duration"] = spec["duration"]
 
     return {
         "apiVersion": f"{CM_GROUP}/{CM_VERSION}",
