@@ -43,7 +43,6 @@ import ssl
 import time
 
 from ..retry import with_retries
-from ..utils import leaf_pem
 from ..wsman import WSManClient
 from .base import Credentials, CsrProvisioner, resolve_credentials
 
@@ -340,10 +339,17 @@ class IDRAC8Provisioner(CsrProvisioner):
         # "Certificate import operation failed". ExportSSLCertificate returns
         # raw PEM, and import is its mirror image.
         #
-        # Leaf only: CertificateType 1 is the single web-server certificate
-        # slot (Dell's type 2 is the Directory Service CA, not a chain slot),
-        # and an ACME issuer returns leaf + intermediates in one PEM.
-        payload = (leaf_pem(cert_pem) + b"\n").decode()
+        # Full chain, leaf first. CertificateType 1 is the web-server slot
+        # (Dell's type 2 is the Directory Service CA, a separate thing), and
+        # despite the profile calling it a single certificate, firmware
+        # 2.86.86.86 accepts a concatenated leaf + intermediate PEM here and
+        # then serves both on the TLS handshake -- confirmed empirically
+        # against i-cobahv01. Importing the leaf alone leaves the iDRAC serving
+        # a chain that only AIA-chasing clients can complete, which is the
+        # whole problem this provisioner exists to avoid. An ACME issuer hands
+        # back leaf + intermediates in exactly this order and without the root,
+        # so cert_pem is passed through untouched.
+        payload = (cert_pem.strip() + b"\n").decode()
 
         with self._connect() as client:
             output = client.invoke(

@@ -509,8 +509,9 @@ def test_import_sends_raw_pem_not_base64(monkeypatch):
     assert "SSLCertType" not in params
 
 
-def test_import_sends_only_the_leaf_not_the_issuing_chain(monkeypatch):
-    """CertificateType 1 is a single server-cert slot, not a chain slot."""
+def test_import_sends_the_full_chain_leaf_first(monkeypatch):
+    """Firmware 2.86.86.86 accepts leaf + intermediate here and serves both,
+    so the whole ACME bundle is imported rather than stripped to the leaf."""
     leaf = _cert()
     intermediate = _cert(cn="Issuing CA", dns=())
     bundle = leaf + intermediate
@@ -521,8 +522,9 @@ def test_import_sends_only_the_leaf_not_the_issuing_chain(monkeypatch):
     prov.import_certificate(bundle)
 
     sent = client.calls[0][1]["SSLCertificateFile"]
-    assert sent == leaf.decode()
-    assert sent.count("BEGIN CERTIFICATE") == 1
+    assert sent == bundle.decode()
+    assert sent.count("BEGIN CERTIFICATE") == 2
+    assert sent.startswith(leaf.decode().rstrip())
 
 
 def test_import_resets_the_idrac_to_apply_the_certificate(monkeypatch):
