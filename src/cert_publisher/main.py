@@ -1,14 +1,37 @@
-"""CronJob entrypoint: scan CertPublications and reconcile each one."""
+"""Operator entrypoint: elect a leader, run the controller, shut down cleanly.
+
+The process is long-lived now, so the entrypoint's job is different from the
+CronJob's. It no longer decides success or failure for a batch of publications
+-- that lives on each publication's ``.status`` -- and instead owns three
+things a controller has to get right:
+
+* **Leader election.** Every replica starts and campaigns; only the one holding
+  the lease reconciles, because publishing a certificate writes to a host and
+  must not happen twice.
+* **Shutdown.** SIGTERM stops the queue, lets an in-flight publish finish, and
+  releases the lease so a standby takes over immediately.
+* **Exit codes that mean something to a Deployment.** A lost lease exits
+  non-zero: a process that believes it is the leader and is not must not stay
+  up.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import signal
+import socket
 import sys
+import threading
+import uuid
+from dataclasses import dataclass
 
+from .controller import Controller, ControllerConfig
+from .health import HealthServer
 from .kube import Kube
-from .reconcile import reconcile_publication
-from .status import ERROR, set_status
+from .leader import LeaderElector, LeadershipLost
+
+log = logging.getLogger("cert-publisher")
 
 
 def _setup_logging() -> None:
@@ -18,31 +41,156 @@ def _setup_logging() -> None:
     )
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class OperatorConfig:
+    controller: ControllerConfig
+    health_port: int
+    leader_election: bool
+    lease_name: str
+    lease_namespace: str
+    lease_duration: float
+    renew_deadline: float
+    retry_period: float
+
+    @classmethod
+    def from_env(cls) -> OperatorConfig:
+        controller = ControllerConfig(
+            # Empty/unset WATCH_NAMESPACE reconciles across the whole cluster.
+            namespace=os.environ.get("WATCH_NAMESPACE") or None,
+            workers=max(1, _env_int("WORKER_COUNT", 4)),
+            resync_seconds=_env_float("RESYNC_INTERVAL", 1800.0),
+            resync_jitter=_env_float("RESYNC_JITTER", 0.2),
+            backoff_base_seconds=_env_float("BACKOFF_BASE", 5.0),
+            backoff_max_seconds=_env_float("BACKOFF_MAX", 900.0),
+            watch_timeout_seconds=_env_int("WATCH_TIMEOUT", 300),
+            startup_spread_seconds=_env_float("STARTUP_SPREAD", 60.0),
+            shutdown_timeout_seconds=_env_float("SHUTDOWN_TIMEOUT", 30.0),
+        )
+        return cls(
+            controller=controller,
+            health_port=_env_int("HEALTH_PORT", 8080),
+            leader_election=_env_bool("LEADER_ELECTION", True),
+            lease_name=os.environ.get("LEADER_ELECTION_ID", "cert-publisher"),
+            lease_namespace=(
+                os.environ.get("LEADER_ELECTION_NAMESPACE")
+                or os.environ.get("POD_NAMESPACE")
+                or _service_account_namespace()
+                or "default"
+            ),
+            lease_duration=_env_float("LEADER_LEASE_DURATION", 15.0),
+            renew_deadline=_env_float("LEADER_RENEW_DEADLINE", 10.0),
+            retry_period=_env_float("LEADER_RETRY_PERIOD", 2.0),
+        )
+
+
+def _service_account_namespace() -> str | None:
+    """The namespace this pod runs in, from its service-account token mount."""
+    path = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    try:
+        with open(path) as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _identity() -> str:
+    """A lease holder identity unique to this process, not just this host.
+
+    A restarted pod that reused its name would otherwise look to itself like
+    the still-valid holder of a lease its predecessor took to the grave.
+    """
+    return f"{os.environ.get('POD_NAME') or socket.gethostname()}_{uuid.uuid4()}"
+
+
 def main() -> int:
     _setup_logging()
-    log = logging.getLogger("cert-publisher")
+    config = OperatorConfig.from_env()
 
     kube = Kube()
-    # Empty/unset WATCH_NAMESPACE reconciles across the whole cluster.
-    namespace = os.environ.get("WATCH_NAMESPACE") or None
+    controller = Controller(kube, config.controller)
 
-    publications = kube.list_publications(namespace)
-    log.info("found %d CertPublication(s)", len(publications))
+    health = HealthServer(config.health_port)
+    health.add_liveness_check(controller.healthy)
+    health.start()
 
-    failures = 0
-    for pub in publications:
-        ref = f"{pub['metadata']['namespace']}/{pub['metadata']['name']}"
-        try:
-            reconcile_publication(kube, pub)
-        except Exception as exc:  # keep going; one bad host shouldn't block the rest
-            log.exception("[%s] reconcile failed", ref)
-            set_status(kube, pub, ERROR, str(exc))
-            failures += 1
+    stop_event = threading.Event()
 
-    if failures:
-        log.error("%d/%d publication(s) failed", failures, len(publications))
+    def _handle_signal(signum, _frame) -> None:
+        log.info("received %s; shutting down", signal.Signals(signum).name)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    def _start_leading() -> None:
+        controller.start()
+        health.set_leading(True)
+
+    def _stop_leading() -> None:
+        health.set_leading(False)
+        controller.stop()
+
+    # Ready means "wired up and campaigning", not "leading" -- see health.py
+    # for why a readiness gate only the leader can pass deadlocks a rollout.
+    health.set_ready(True)
+
+    try:
+        if not config.leader_election:
+            log.warning(
+                "leader election is disabled; run exactly one replica, or two "
+                "will publish to the same hosts at the same time"
+            )
+            _start_leading()
+            stop_event.wait()
+            _stop_leading()
+            return 0
+
+        elector = LeaderElector(
+            kube.coordination,
+            name=config.lease_name,
+            namespace=config.lease_namespace,
+            identity=_identity(),
+            lease_duration=config.lease_duration,
+            renew_deadline=config.renew_deadline,
+            retry_period=config.retry_period,
+            labels={"app.kubernetes.io/name": "cert-publisher"},
+        )
+        elector.run(
+            on_started_leading=_start_leading,
+            on_stopped_leading=_stop_leading,
+            stop_event=stop_event,
+        )
+        return 0
+    except LeadershipLost as exc:
+        # Exit non-zero so the Deployment restarts us: a replica that has lost
+        # the lease has to go back to being a standby, and the cheapest way to
+        # be sure it is not still half-reconciling is a fresh process.
+        log.error("%s", exc)
         return 1
-    return 0
+    finally:
+        health.stop()
+        logging.shutdown()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,18 @@
 cert-publisher {{ .Chart.AppVersion }} is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
-The controller runs as a CronJob ({{ .Values.cronjob.schedule }}). It requires
-cert-manager to already be installed in the cluster.
+The controller runs as a Deployment ({{ .Values.replicaCount }} replica(s)). It
+watches CertPublications and the cert-manager resources it owns, so a new
+publication and a freshly issued certificate are acted on within seconds, and
+re-checks every publication every {{ div (int .Values.controller.resyncInterval) 60 }} minutes to catch drift on the
+target hosts. It requires cert-manager to already be installed in the cluster.
+
+{{- if .Values.leaderElection.enabled }}
+Exactly one replica reconciles at a time, elected through a Lease named
+{{ .Values.leaderElection.name | default (include "cert-publisher.fullname" .) }} in this namespace.
+{{- else }}
+WARNING: leader election is disabled. Run exactly one replica, or two will
+publish to the same hosts at the same time.
+{{- end }}
 
 {{- if .Values.config.watchNamespace }}
 Reconciliation is scoped to namespace: {{ .Values.config.watchNamespace }}
@@ -9,8 +20,28 @@ Reconciliation is scoped to namespace: {{ .Values.config.watchNamespace }}
 Reconciliation covers CertPublications across the whole cluster.
 {{- end }}
 
+{{- if .Values.cronjob }}
+{{- if .Values.cronjob.suspend }}
+
+NOTE: cronjob.suspend is set, so the Deployment is scaled to zero and nothing
+is being reconciled. Set it to false (or remove it) to resume.
+{{- end }}
+{{- if or .Values.cronjob.schedule .Values.cronjob.concurrencyPolicy .Values.cronjob.backoffLimit .Values.cronjob.activeDeadlineSeconds .Values.cronjob.successfulJobsHistoryLimit .Values.cronjob.failedJobsHistoryLimit }}
+
+NOTE: this release still sets values under `cronjob.` that no longer do
+anything -- the controller watches now rather than polling on a schedule. Move
+`cronjob.schedule` to `controller.resyncInterval` (in seconds) if you were
+using it to control how often hosts are re-checked, and drop the rest.
+{{- end }}
+{{- end }}
+
 Create a CertPublication to start publishing certificates. See the examples at
 https://github.com/charlespick/cert-publisher/tree/main/examples
 
 Watch progress with:
   kubectl get certpublications -A
+  kubectl describe certpublication <name>
+
+A publication that cannot reach its host reports the reason on itself and is
+retried with backoff; it no longer fails the controller or holds up any other
+publication.

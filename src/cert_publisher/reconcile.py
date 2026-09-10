@@ -16,6 +16,13 @@ are two implementations rather than one with branches threaded through it:
     no issued Secret; the host emits a CSR, a CertificateRequest signs it, and
     the signed certificate is imported back. Because a CertificateRequest is
     signed once and never renewed, this path also owns renewal timing.
+
+Both return a :class:`Result`. A reconcile is a single pass that leaves the
+publication in the best state it can reach *now* and says when it wants looking
+at again -- it never blocks waiting for cert-manager or for a host. Most passes
+want nothing in particular and let the controller's resync decide; the ones
+that are mid-handshake ask for a sooner look, so a missed watch event costs a
+minute rather than a resync interval.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import logging
+from dataclasses import dataclass
 
 from .certmanager import (
     CR_FAILED,
@@ -35,7 +43,18 @@ from .certmanager import (
 )
 from .kube import Kube
 from .provisioners import build_provisioner, manages_own_key
-from .status import ERROR, PENDING, PUBLISHED, set_status
+from .status import (
+    ERROR,
+    PENDING,
+    PUBLISHED,
+    REASON_MISCONFIGURED,
+    REASON_SIGNING_COOLDOWN,
+    REASON_SIGNING_FAILED,
+    REASON_SIGNING_NOT_SIGNED,
+    REASON_SIGNING_PENDING,
+    REASON_UNUSABLE_CERTIFICATE,
+    set_status,
+)
 from .utils import (
     certificate_dns_names,
     leaf_certificate,
@@ -46,22 +65,46 @@ from .utils import (
 
 log = logging.getLogger("cert-publisher.reconcile")
 
+# How soon to look again at a publication waiting on cert-manager. The watches
+# on Certificates and CertificateRequests normally get there first; this is the
+# floor under a watch event that never arrives, and it is cheap because none of
+# the waiting paths touch the target host.
+_AWAITING_ISSUANCE_REQUEUE = datetime.timedelta(minutes=2)
 
-def reconcile_publication(kube: Kube, pub: dict) -> None:
+# How soon to look again after clearing a signing request that cannot be used
+# (vanished, or rejected). The next pass opens a fresh round, so there is no
+# reason to make it wait -- but it goes through the queue rather than looping
+# here, so it is still subject to the queue's ordering and shutdown.
+_RESTART_SIGNING_REQUEUE = datetime.timedelta(seconds=5)
+
+
+@dataclass(frozen=True)
+class Result:
+    """What a reconcile pass wants to happen next.
+
+    ``requeue_after`` of ``None`` means "nothing in particular": the controller
+    falls back to its resync interval, which is what a settled publication
+    wants -- the state that can change without an API event is on a host
+    outside the cluster, and only a periodic look finds it.
+    """
+
+    requeue_after: datetime.timedelta | None = None
+
+
+def reconcile_publication(kube: Kube, pub: dict) -> Result:
     meta = pub["metadata"]
     spec = pub["spec"]
     ref = f"{meta['namespace']}/{meta['name']}"
 
     if manages_own_key(spec["provisioner"]["type"]):
-        _reconcile_host_keyed(kube, pub, ref)
-    else:
-        _reconcile_secret_keyed(kube, pub, ref)
+        return _reconcile_host_keyed(kube, pub, ref)
+    return _reconcile_secret_keyed(kube, pub, ref)
 
 
 # -- cert-manager owns the key (ssh, winrm) -------------------------------
 
 
-def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
+def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     meta = pub["metadata"]
     spec = pub["spec"]
     name = meta["name"]
@@ -77,7 +120,7 @@ def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
         kube.create_certificate(namespace, build_certificate_body(pub, secret_name))
         log.info("[%s] Certificate created; will publish once it is issued", ref)
         set_status(kube, pub, PENDING, "Certificate created; awaiting issuance")
-        return
+        return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)
 
     drift = certificate_spec_drift(existing, pub, secret_name)
     if drift is not None:
@@ -85,7 +128,7 @@ def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
         kube.patch_certificate(namespace, name, drift)
         log.info("[%s] Certificate updated; will publish once reissued", ref)
         set_status(kube, pub, PENDING, "Certificate updated; awaiting reissuance")
-        return
+        return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)
 
     # 2. The Certificate exists; wait until cert-manager has populated the Secret
     #    with both the certificate and its private key.
@@ -93,7 +136,7 @@ def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
     if secret is None or not secret.data or "tls.crt" not in secret.data or "tls.key" not in secret.data:
         log.info("[%s] certificate not yet issued, waiting", ref)
         set_status(kube, pub, PENDING, "Awaiting certificate issuance")
-        return
+        return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)
 
     data = kube.secret_data(secret)
     cert_pem = data["tls.crt"]
@@ -113,7 +156,7 @@ def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
             kube, pub, PUBLISHED, message,
             published_fingerprint=desired,
         )
-        return
+        return Result()
 
     # 4. Publish.
     log.info("[%s] publishing certificate %s", ref, desired[:16])
@@ -123,6 +166,7 @@ def _reconcile_secret_keyed(kube: Kube, pub: dict, ref: str) -> None:
         kube, pub, PUBLISHED, "Certificate published",
         published_fingerprint=desired, mark_published=True,
     )
+    return Result()
 
 
 # -- the host owns the key (idrac8) ---------------------------------------
@@ -138,7 +182,7 @@ _SIGNING_COOLDOWN = datetime.timedelta(hours=1)
 _REQUEST_TIMEOUT = datetime.timedelta(hours=1)
 
 
-def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
+def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     meta = pub["metadata"]
     spec = pub["spec"]
     namespace = meta["namespace"]
@@ -151,8 +195,7 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
     #    renewal while a request is outstanding would strand the pending CSR.
     pending = status.get("pendingRequestName")
     if pending:
-        _resolve_pending_request(kube, pub, prov, pending, ref)
-        return
+        return _resolve_pending_request(kube, pub, prov, pending, ref)
 
     # 2. Decide whether the certificate the host holds still does the job.
     installed = prov.installed_certificate()
@@ -164,8 +207,13 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
         # import and reboot the BMC again. cert-manager rejects this on a
         # Certificate; nothing validates it on this path, so do it here.
         log.error("[%s] %s", ref, misconfigured)
-        set_status(kube, pub, ERROR, f"Misconfigured: {misconfigured}")
-        return
+        set_status(
+            kube, pub, ERROR, f"Misconfigured: {misconfigured}",
+            reason=REASON_MISCONFIGURED,
+        )
+        # Only an edit fixes this, and an edit is an event we already watch
+        # for; there is nothing a sooner look would find.
+        return Result()
 
     reason = _renewal_reason(installed, spec, status)
     if reason is None:
@@ -175,7 +223,7 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
             kube, pub, PUBLISHED, "Certificate up to date",
             published_fingerprint=fingerprint,
         )
-        return
+        return Result()
 
     # 3. Renewal is wanted -- but if we only just signed, the last round did not
     #    achieve it. Signing again would rotate the key and reset the BMC on
@@ -204,15 +252,18 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> None:
             f"the issuer and any approver policy for this namespace. Editing "
             f"the publication retries immediately; so does clearing "
             f".status.lastSigningTime.",
+            reason=REASON_SIGNING_COOLDOWN,
         )
-        return
+        # Come back when the cooldown is actually up rather than on the resync,
+        # which could be either side of it.
+        return Result(requeue_after=remaining + datetime.timedelta(seconds=5))
     if spec_changed and since is not None and since < _SIGNING_COOLDOWN:
         log.info("[%s] publication changed; retrying without waiting out the "
                  "signing cooldown", ref)
 
     # 4. Have the host mint a CSR and ask cert-manager to sign it.
     log.info("[%s] renewing: %s", ref, reason)
-    _start_signing(kube, pub, prov, ref, reason)
+    return _start_signing(kube, pub, prov, ref, reason)
 
 
 def _time_since(stamp: str | None) -> datetime.timedelta | None:
@@ -310,7 +361,7 @@ def _unusable_signed_certificate(cert_pem: bytes, spec: dict) -> str | None:
 
 def _resolve_pending_request(
     kube: Kube, pub: dict, prov, pending: str, ref: str
-) -> None:
+) -> Result:
     """Act on the outstanding CertificateRequest, if it has an answer yet."""
     meta = pub["metadata"]
     spec = pub["spec"]
@@ -322,9 +373,10 @@ def _resolve_pending_request(
         set_status(
             kube, pub, PENDING,
             "Pending signing request disappeared; a new one will be created",
+            reason=REASON_SIGNING_FAILED,
             pending_request=None,
         )
-        return
+        return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
     state, detail = certificate_request_state(request)
     if state == CR_FAILED:
@@ -335,9 +387,10 @@ def _resolve_pending_request(
         set_status(
             kube, pub, PENDING,
             f"Signing request failed ({detail}); a new one will be created",
+            reason=REASON_SIGNING_FAILED,
             pending_request=None,
         )
-        return
+        return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
     if state != CR_READY:
         age = _time_since(
@@ -356,12 +409,16 @@ def _resolve_pending_request(
                 f"Signing request was not signed within {_REQUEST_TIMEOUT} "
                 f"({detail}); check that an approver is configured for this "
                 f"issuer. A new request will be created.",
+                reason=REASON_SIGNING_NOT_SIGNED,
                 pending_request=None,
             )
-            return
+            return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
         log.info("[%s] signing request %s is pending: %s", ref, pending, detail)
-        set_status(kube, pub, PENDING, f"Awaiting certificate issuance ({detail})")
-        return
+        set_status(
+            kube, pub, PENDING, f"Awaiting certificate issuance ({detail})",
+            reason=REASON_SIGNING_PENDING,
+        )
+        return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)
 
     cert_pem = issued_certificate(request)
     problem = _unusable_signed_certificate(cert_pem, spec)
@@ -373,9 +430,12 @@ def _resolve_pending_request(
             f"The signed certificate was not installed because {problem}. This "
             f"usually means the host's CSR did not carry the requested subject "
             f"alternative names.",
+            reason=REASON_UNUSABLE_CERTIFICATE,
             pending_request=None,
         )
-        return
+        # A fresh round is gated by the signing cooldown anyway, so there is
+        # nothing to gain from asking for one sooner than the resync.
+        return Result()
 
     fingerprint = sha256_fingerprint(cert_pem)
 
@@ -398,6 +458,7 @@ def _resolve_pending_request(
         published_fingerprint=fingerprint, mark_published=True,
         pending_request=None,
     )
+    return Result()
 
 
 def _already_installed(prov, fingerprint: str) -> bool:
@@ -416,7 +477,7 @@ def _already_installed(prov, fingerprint: str) -> bool:
         return False
 
 
-def _start_signing(kube: Kube, pub: dict, prov, ref: str, reason: str) -> None:
+def _start_signing(kube: Kube, pub: dict, prov, ref: str, reason: str) -> Result:
     """Rotate the host's key, then submit its CSR to cert-manager."""
     meta = pub["metadata"]
     spec = pub["spec"]
@@ -440,9 +501,11 @@ def _start_signing(kube: Kube, pub: dict, prov, ref: str, reason: str) -> None:
     set_status(
         kube, pub, PENDING,
         f"Signing request submitted ({reason}); awaiting issuance",
+        reason=REASON_SIGNING_PENDING,
         pending_request=request_name, mark_signing=True, strict=True,
     )
     log.info("[%s] creating CertificateRequest %s", ref, request_name)
     kube.create_certificate_request(
         namespace, build_certificate_request_body(pub, request_name, csr_pem)
     )
+    return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)

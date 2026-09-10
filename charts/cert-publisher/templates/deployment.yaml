@@ -1,0 +1,154 @@
+{{- $replicas := int .Values.replicaCount -}}
+{{- /*
+  Backwards compatibility with the CronJob this chart used to install:
+  `cronjob.suspend=true` was how a release was paused without uninstalling it,
+  and it keeps meaning that. Everything else under `cronjob.` is inert now --
+  NOTES.txt says so on upgrade.
+*/ -}}
+{{- if .Values.cronjob -}}
+{{- if .Values.cronjob.suspend -}}
+{{- $replicas = 0 -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cert-publisher.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cert-publisher.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  strategy:
+    # maxSurge 0 so a replacement pod is never running while the pod it
+    # replaces still holds the lease: the outgoing pod releases it on SIGTERM,
+    # and its replacement then takes over in about a second rather than waiting
+    # out a full lease duration.
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      {{- include "cert-publisher.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cert-publisher.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cert-publisher.serviceAccountName" . }}
+      # Must exceed controller.shutdownTimeout: a reconcile caught mid-publish
+      # is talking SSH or WS-Man to a host and cannot be interrupted safely, so
+      # it is given that long to finish before the pod is killed.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cert-publisher
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.healthProbe.port }}
+              protocol: TCP
+          env:
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            # Leave WATCH_NAMESPACE empty to reconcile the whole cluster.
+            - name: WATCH_NAMESPACE
+              value: {{ .Values.config.watchNamespace | quote }}
+            # Identifies this replica in the lease it holds and in the Events
+            # it records, so a two-replica install shows which one acted.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HEALTH_PORT
+              value: {{ .Values.healthProbe.port | quote }}
+            - name: WORKER_COUNT
+              value: {{ .Values.controller.workers | quote }}
+            - name: RESYNC_INTERVAL
+              value: {{ .Values.controller.resyncInterval | quote }}
+            - name: RESYNC_JITTER
+              value: {{ .Values.controller.resyncJitter | quote }}
+            - name: STARTUP_SPREAD
+              value: {{ .Values.controller.startupSpread | quote }}
+            - name: BACKOFF_BASE
+              value: {{ .Values.controller.backoffBase | quote }}
+            - name: BACKOFF_MAX
+              value: {{ .Values.controller.backoffMax | quote }}
+            - name: WATCH_TIMEOUT
+              value: {{ .Values.controller.watchTimeout | quote }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ .Values.controller.shutdownTimeout | quote }}
+            - name: LEADER_ELECTION
+              value: {{ .Values.leaderElection.enabled | quote }}
+            - name: LEADER_ELECTION_ID
+              value: {{ .Values.leaderElection.name | default (include "cert-publisher.fullname" .) | quote }}
+            - name: LEADER_LEASE_DURATION
+              value: {{ .Values.leaderElection.leaseDuration | quote }}
+            - name: LEADER_RENEW_DEADLINE
+              value: {{ .Values.leaderElection.renewDeadline | quote }}
+            - name: LEADER_RETRY_PERIOD
+              value: {{ .Values.leaderElection.retryPeriod | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Liveness fails when a watch has gone silent -- neither delivering
+          # events nor erroring -- which no amount of waiting fixes. Readiness
+          # is deliberately not gated on holding the lease: a standby is a
+          # working pod, and gating it there would deadlock a rollout.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.healthProbe.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthProbe.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthProbe.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthProbe.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: {{ .Values.healthProbe.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthProbe.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthProbe.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthProbe.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

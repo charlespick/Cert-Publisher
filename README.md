@@ -13,12 +13,14 @@ WinRM, and reloading whatever needs to pick it up.
 
 A `CertPublication` custom resource declares the certificate you want (DNS
 names, issuer) and where it should be installed (the provisioner). The
-controller runs as a Kubernetes `CronJob`. On each run it scans every
-`CertPublication` and, for each one:
+controller runs as a Kubernetes `Deployment` and **watches**: it reacts to a new
+or edited `CertPublication`, and to cert-manager issuing a certificate, within
+seconds. For each publication it:
 
 1. **Ensures a cert-manager `Certificate` exists and matches the spec.** If
    it's missing, the controller creates one owned by the `CertPublication` and
-   moves on — the cert is published on a later run once it's been issued. If the
+   moves on — the watch on that `Certificate` brings it straight back the moment
+   cert-manager issues. If the
    publication's subjects, issuer, or renewal settings later change, the
    controller patches the owned `Certificate` so cert-manager reissues.
    cert-manager owns renewal and rotation timing throughout.
@@ -29,28 +31,96 @@ controller runs as a Kubernetes `CronJob`. On each run it scans every
    post-install hook (e.g. `systemctl reload nginx`).
 
 Because the compare step is fingerprint-based and cert-manager drives renewal
-timing, the job is idempotent: it's a no-op until there's genuinely new
+timing, a reconcile is idempotent: it's a no-op until there's genuinely new
 material to push.
 
-Each reconcile records its outcome on the resource's `.status` (phase,
-message, the published leaf fingerprint, and last-published/last-reconcile
-timestamps), so `kubectl get certpublications` shows what's been pushed and
-`kubectl describe` surfaces the last error:
+```
+     CertPublication ──────watch──────┐
+            │                         ▼
+            │                  Cert-Publisher ── SSH/WinRM/WS-Man ──▶ target host
+            │                    ▲        │
+            ▼                    │        └── writes .status + Events
+      cert-manager ──issues──▶ Certificate + Secret (tls.crt/tls.key)
+                                 └──────watch──────┘
+```
+
+### Watching, not polling
+
+Three watches feed one work queue:
+
+| Watched | Wakes | Because |
+| --- | --- | --- |
+| `CertPublication` | itself | a publication was created or edited |
+| cert-manager `Certificate` | its owning publication | material was issued or reissued |
+| cert-manager `CertificateRequest` | its owning publication | a host-generated CSR was signed |
+
+Certificates and CertificateRequests map back through the `ownerReferences`
+cert-publisher sets when it creates them, so only the publication actually
+waiting on a piece of material is woken — and Certificates managed by anything
+else are ignored. Nothing watches `Secret`s: the operator learns that a
+certificate was issued from the `Certificate` resource, so it never needs
+`list`/`watch` on every Secret in the cluster.
+
+Everything else about the queue exists to make that safe:
+
+- **Deduplication.** A publication edited, issued and reissued in the same
+  second is one reconcile, not three.
+- **Per-publication serialisation.** A key being reconciled is never handed to
+  a second worker, so two workers never talk to the same target host at once.
+  Different publications do run concurrently (`controller.workers`, 4 by
+  default) — one unreachable host doesn't hold up the rest.
+- **Exponential backoff.** A reconcile that fails is retried after
+  `controller.backoffBase`, doubling to `controller.backoffMax`, per
+  publication.
+- **Resync.** Every publication is looked at again every
+  `controller.resyncInterval` (30 minutes by default), scattered so a fleet
+  issued on the same afternoon doesn't reconcile in lockstep. This is what
+  catches the state no API event can report: a certificate replaced on the host
+  by hand, an iDRAC that reverted, a host-keyed certificate ageing into its
+  renewal window.
+
+### Failure is per-publication
+
+A host that is down is a `CertPublication` in `Error` with the reason on it and
+a retry scheduled — not a failed pod, and not something that stops the other
+ninety-nine publications from being reconciled at all.
+
+Each reconcile records its outcome on the resource's `.status`: `phase`,
+`message`, a machine-readable `reason`, a standard `Ready` condition, the
+published leaf fingerprint, `nextRetryTime` while a retry is pending, and
+last-published/last-reconcile timestamps. Transitions are also recorded as
+Events, so `kubectl describe` shows the history rather than just the latest
+state.
 
 ```
-NAME    DNS                  PROVISIONER   PHASE       PUBLISHED
-web01   web01.example.com    ssh           Published   5m
-win01   win01.example.com    winrm         Pending     
+$ kubectl get certpublications -A
+NAME    DNS                  PROVISIONER   READY   PHASE       PUBLISHED
+web01   web01.example.com    ssh           True    Published   5m
+idrac1  idrac1.example.com   idrac8        False   Pending     2d
+win01   win01.example.com    winrm         False   Error       9m
 ```
 
+```sh
+# Block until a publication has actually reached its host.
+kubectl wait --for=condition=Ready certpublication/web01 --timeout=5m
 ```
-cert-manager  ──issues──▶  Secret (tls.crt/tls.key)
-                                │
-                                ▼
-        CronJob ── reads ──▶ Cert-Publisher ── SSH/WinRM ──▶ target host
-                                ▲
-                     CertPublication (desired state)
-```
+
+### One replica reconciles
+
+Publishing a certificate writes to a host: it installs files, imports a PFX,
+reboots an iDRAC. Two replicas doing that at once would install twice and, on
+the iDRAC path, rotate the host's key out from under each other's pending
+`CertificateRequest`. So the controller uses `coordination.k8s.io` `Lease`
+leader election — every replica runs and campaigns, only the leaseholder
+reconciles, and a clean shutdown releases the lease so a standby takes over in
+about a second rather than waiting out a full lease duration. Raising
+`replicaCount` buys faster failover, not more throughput.
+
+`/healthz` fails when a watch has gone silent — neither delivering events nor
+erroring — which restarts the pod so it relists. `/readyz` answers "wired up
+and campaigning", deliberately *not* "leading": a readiness gate only the
+leader can pass would deadlock a rolling update. `/leader` answers the honest
+question, and is kept out of the probes for that reason.
 
 ## Provisioners
 
@@ -106,9 +176,9 @@ The one remaining exception is `postInstallScript`, which is still written to a
 temp `.ps1` and run by path so operator scripts keep working unchanged.
 
 The hook must be non-interactive — no `Read-Host`, `Get-Credential`, nested
-prompts, or mandatory parameters left without a value. There is no operator
-attached to a CronJob run, so any prompt fails the publication immediately with
-a message naming the call that was refused.
+prompts, or mandatory parameters left without a value. There is nobody attached
+to a reconcile, so any prompt fails the publication immediately with a message
+naming the call that was refused.
 
 `powershell: "7"` selects the `PowerShell.7` PSRP session configuration rather
 than launching `pwsh.exe`. That endpoint is registered by PowerShell 7's
@@ -225,10 +295,10 @@ helm install cert-publisher \
   --namespace cert-publisher --create-namespace
 ```
 
-This installs the CRD, RBAC, a ServiceAccount, and the CronJob (image
-`ghcr.io/charlespick/cert-publisher`). By default the controller reconciles
-`CertPublication`s across the whole cluster; scope it to one namespace with
-`--set config.watchNamespace=<namespace>`.
+This installs the CRD, RBAC, a ServiceAccount, and the controller Deployment
+(image `ghcr.io/charlespick/cert-publisher`). By default the controller
+reconciles `CertPublication`s across the whole cluster; scope it to one
+namespace with `--set config.watchNamespace=<namespace>`.
 
 To install from a checkout of this repository instead:
 
@@ -248,12 +318,33 @@ for the full list):
 | `image.tag` | chart `appVersion` | Controller image tag |
 | `config.logLevel` | `INFO` | Log level |
 | `config.watchNamespace` | `""` (whole cluster) | Namespace to scope reconciliation to |
-| `cronjob.schedule` | `*/30 * * * *` | Reconcile schedule |
-| `cronjob.suspend` | `false` | Pause reconciliation without uninstalling |
+| `replicaCount` | `1` | Controller replicas; extras stand by for the lease |
+| `controller.workers` | `4` | Publications reconciled concurrently |
+| `controller.resyncInterval` | `1800` | Seconds between re-checks of a settled publication |
+| `controller.backoffBase` / `.backoffMax` | `5` / `900` | Retry backoff, in seconds, for a failing publication |
+| `leaderElection.enabled` | `true` | Elect one active replica via a `Lease` |
+| `podDisruptionBudget.enabled` | `false` | Only useful with `replicaCount > 1` |
 | `crds.install` | `true` | Install the `CertPublication` CRD with the release |
 
 The CRD carries a `helm.sh/resource-policy: keep` annotation, so uninstalling
 the release leaves the CRD and any `CertPublication`s in place.
+
+### Upgrading from the CronJob
+
+`helm upgrade` and nothing else. Helm removes the `CronJob` and creates the
+`Deployment`; the CRD's `spec` schema is unchanged, so every existing
+`CertPublication` keeps working untouched. Two notes:
+
+- Values under `cronjob.` no longer do anything, except `cronjob.suspend`,
+  which still pauses the release (it now scales the Deployment to zero). If you
+  were using `cronjob.schedule` to control how often hosts get re-checked, set
+  `controller.resyncInterval` (in **seconds**) instead. The upgrade notes say
+  so if the release still sets them.
+- The ClusterRole gains `list`/`watch` on cert-manager `Certificates` and
+  `CertificateRequests` and `create`/`patch` on Events, and a namespaced Role
+  for the leader-election `Lease`. All of that is in the chart; if you manage
+  RBAC yourself (`rbac.create=false`), apply the equivalent from
+  [`charts/cert-publisher/templates/rbac.yaml`](charts/cert-publisher/templates/rbac.yaml).
 
 ## Development
 
@@ -267,11 +358,16 @@ The package lives in `src/cert_publisher/`:
 
 | Module | Responsibility |
 | --- | --- |
-| `main.py` | CronJob entrypoint; scans and reconciles every publication |
+| `main.py` | Entrypoint: leader election, signals, exit codes |
+| `controller.py` | Watches, work queue, workers, backoff, resync |
+| `workqueue.py` | Deduplicating, rate-limited, delaying key queue |
+| `leader.py` | `Lease`-based leader election |
+| `health.py` | `/healthz`, `/readyz`, `/leader` |
 | `reconcile.py` | Per-publication reconcile logic |
+| `status.py` | `.status`, conditions and Events |
 | `certmanager.py` | Builds the owned cert-manager `Certificate` |
 | `kube.py` | Kubernetes API access |
-| `provisioners/` | `ssh` and `winrm` install backends |
+| `provisioners/` | `ssh`, `winrm` and `idrac8` install backends |
 | `provisioners/scripts/` | Static PowerShell run by the WinRM provisioner |
 | `utils.py` | Certificate parsing / fingerprints |
 

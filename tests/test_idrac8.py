@@ -62,6 +62,7 @@ class _FakeKube:
         self.deleted = []
         self.status = {}
         self.events = []
+        self.recorded = []
 
     def get_certificate_request(self, namespace, name):
         return self.request
@@ -80,6 +81,9 @@ class _FakeKube:
 
     def get_secret(self, namespace, name):
         return None
+
+    def record_event(self, pub, event_type, reason, message):
+        self.recorded.append((event_type, reason, message))
 
 
 def _csr(cn="idrac01.example.com", key_usage=True) -> bytes:

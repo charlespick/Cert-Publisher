@@ -10,6 +10,11 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# One replica reconciles; any others stand by, campaigning for the lease and
+# ready to take over. Raising this buys faster failover, not more throughput --
+# publishing a certificate writes to a host, so exactly one replica may do it.
+replicaCount: 1
+
 crds:
   # Install the CertPublication CRD as part of the release. Set to false if you
   # manage the CRD separately (e.g. a shared cluster where another release owns
@@ -17,9 +22,9 @@ crds:
   install: true
 
 rbac:
-  # Create the ClusterRole and ClusterRoleBinding the controller needs to read
-  # CertPublications and Secrets cluster-wide and manage cert-manager
-  # Certificates.
+  # Create the ClusterRole and ClusterRoleBinding the controller needs to watch
+  # CertPublications and read Secrets cluster-wide and manage cert-manager
+  # Certificates, plus the namespaced Role for its leader-election Lease.
   create: true
 
 serviceAccount:
@@ -28,27 +33,90 @@ serviceAccount:
   name: ""
   annotations: {}
 
-# Controller configuration, surfaced as environment variables on the job.
+# Controller configuration, surfaced as environment variables on the pod.
 config:
   logLevel: INFO
   # Leave empty to reconcile CertPublications across the whole cluster, or set a
   # namespace to scope reconciliation to it.
   watchNamespace: ""
 
+controller:
+  # How many publications may be reconciled at once. Each one is a slow,
+  # network-bound conversation with a host, so this is about not letting one
+  # unreachable target hold up the rest -- reconciles of the *same*
+  # publication are serialised no matter what this is set to.
+  workers: 4
+  # How often a settled publication is looked at again, in seconds. Watches
+  # cover everything that happens inside the cluster; this covers what does
+  # not raise an event at all -- a certificate replaced on the host by hand, an
+  # iDRAC that reverted, a host-keyed certificate ageing into its renewal
+  # window.
+  resyncInterval: 1800
+  # Fraction of resyncInterval to scatter resyncs over, so a fleet issued on
+  # the same afternoon does not reconcile in lockstep forever.
+  resyncJitter: 0.2
+  # Window, in seconds, to spread the first reconcile of every publication
+  # over after startup or a relist. Converging on a fleet should not mean
+  # opening a connection to all of it at once.
+  startupSpread: 60
+  # Exponential backoff between retries of a failing publication, in seconds:
+  # first retry after backoffBase, doubling to backoffMax. A failure is
+  # recorded on that publication's .status and retried; it never fails the pod
+  # or holds up any other publication.
+  backoffBase: 5
+  backoffMax: 900
+  # How long each watch connection lives before the apiserver closes it and the
+  # controller resumes. A bounded watch is how a silently dead connection gets
+  # noticed.
+  watchTimeout: 300
+  # How long a shutdown waits for an in-flight publish to finish. Keep
+  # terminationGracePeriodSeconds comfortably above this.
+  shutdownTimeout: 30
+
+leaderElection:
+  # Only the replica holding the Lease reconciles. Disabling this is only safe
+  # with exactly one replica: two publishing to the same host would install
+  # twice and, on the iDRAC path, rotate the host's key out from under each
+  # other's pending CertificateRequest.
+  enabled: true
+  # Lease name. Defaults to the release fullname when empty.
+  name: ""
+  # Seconds a candidate must watch the Lease go unrenewed before taking it.
+  leaseDuration: 15
+  # Seconds the holder has to renew before it gives up leading. Must be less
+  # than leaseDuration, so a leader stands down before its successor may start.
+  renewDeadline: 10
+  # Seconds between acquire/renew attempts. Must be less than renewDeadline.
+  retryPeriod: 2
+
+healthProbe:
+  port: 8080
+  # /healthz fails when a watch has gone silent, which restarts the pod so it
+  # relists.
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # /readyz answers "wired up and campaigning", not "leading" -- see the chart
+  # README. A standby is a working pod.
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+podDisruptionBudget:
+  # Only meaningful with replicaCount > 1; a single-replica controller has no
+  # availability to budget for, and a PDB over it would block node drains.
+  enabled: false
+  minAvailable: 1
+
 # Extra environment variables for the container.
 extraEnv: []
 
-cronjob:
-  # cert-manager decides when a cert is renewed; this job just picks up the new
-  # material and pushes it to targets on its next run.
-  schedule: "*/30 * * * *"
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
-  backoffLimit: 1
-  activeDeadlineSeconds: 900
-  # Optional suspend toggle for pausing reconciliation without uninstalling.
-  suspend: false
+# Must exceed controller.shutdownTimeout so a publish in flight can finish.
+terminationGracePeriodSeconds: 60
 
 resources:
   requests:
@@ -74,3 +142,13 @@ podLabels: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# Deprecated. The controller was a CronJob before it was an operator, and it no
+# longer polls on a schedule -- it watches. Only `cronjob.suspend` still does
+# anything: it scales the Deployment to zero, as it used to suspend the
+# CronJob. Everything else here is ignored, and the whole block will be removed
+# in a future release.
+cronjob:
+  suspend: false
