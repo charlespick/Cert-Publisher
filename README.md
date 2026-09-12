@@ -113,11 +113,17 @@ the iDRAC path, rotate the host's key out from under each other's pending
 `CertificateRequest`. So the controller uses `coordination.k8s.io` `Lease`
 leader election — every replica runs and campaigns, only the leaseholder
 reconciles, and a clean shutdown releases the lease so a standby takes over in
-about a second rather than waiting out a full lease duration. Raising
-`replicaCount` buys faster failover, not more throughput.
+about a second rather than waiting out a full lease duration. If a publish is
+still running when `controller.shutdownTimeout` expires, the lease is *not*
+released: it is left to expire instead, because handing it over while this pod
+is still writing to a host is what leader election is there to prevent.
+Raising `replicaCount` buys faster failover, not more throughput.
 
-`/healthz` fails when a watch has gone silent — neither delivering events nor
-erroring — which restarts the pod so it relists. `/readyz` answers "wired up
+`/healthz` fails on the two things that stop the controller without stopping
+the process: a watch gone silent — neither delivering events nor erroring —
+and a reconcile still running after `controller.reconcileTimeout`, which means
+a provisioner call has hung and is holding a worker that every publication
+behind it is waiting on. Either restarts the pod. `/readyz` answers "wired up
 and campaigning", deliberately *not* "leading": a readiness gate only the
 leader can pass would deadlock a rolling update. `/leader` answers the honest
 question, and is kept out of the probes for that reason.
@@ -322,6 +328,7 @@ for the full list):
 | `controller.workers` | `4` | Publications reconciled concurrently |
 | `controller.resyncInterval` | `1800` | Seconds between re-checks of a settled publication |
 | `controller.backoffBase` / `.backoffMax` | `5` / `900` | Retry backoff, in seconds, for a failing publication |
+| `controller.reconcileTimeout` | `900` | Seconds one reconcile may run before liveness treats the pod as wedged |
 | `leaderElection.enabled` | `true` | Elect one active replica via a `Lease` |
 | `podDisruptionBudget.enabled` | `false` | Only useful with `replicaCount > 1` |
 | `crds.install` | `true` | Install the `CertPublication` CRD with the release |

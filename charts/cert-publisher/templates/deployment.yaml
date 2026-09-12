@@ -99,6 +99,8 @@ spec:
               value: {{ .Values.controller.watchTimeout | quote }}
             - name: SHUTDOWN_TIMEOUT
               value: {{ .Values.controller.shutdownTimeout | quote }}
+            - name: RECONCILE_TIMEOUT
+              value: {{ .Values.controller.reconcileTimeout | quote }}
             - name: LEADER_ELECTION
               value: {{ .Values.leaderElection.enabled | quote }}
             - name: LEADER_ELECTION_ID

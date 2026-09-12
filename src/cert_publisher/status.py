@@ -17,10 +17,10 @@ alone. That means three things are written together:
 
 from __future__ import annotations
 
-import datetime
 import logging
 
 from .kube import Kube
+from .utils import now_rfc3339
 
 log = logging.getLogger("cert-publisher.status")
 
@@ -62,10 +62,6 @@ _MAX_MESSAGE = 32 * 1024
 _UNSET = object()
 
 
-def _now() -> str:
-    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _ready_condition(pub: dict, phase: str, reason: str, message: str) -> dict:
     """The ``Ready`` condition for this outcome, merged onto the current one.
 
@@ -79,9 +75,9 @@ def _ready_condition(pub: dict, phase: str, reason: str, message: str) -> dict:
 
     state = "True" if phase == PUBLISHED else "False"
     if existing and existing.get("status") == state:
-        transitioned = existing.get("lastTransitionTime") or _now()
+        transitioned = existing.get("lastTransitionTime") or now_rfc3339()
     else:
-        transitioned = _now()
+        transitioned = now_rfc3339()
 
     condition = {
         "type": READY,
@@ -135,7 +131,7 @@ def set_status(
         "phase": phase,
         "message": message,
         "reason": reason,
-        "lastReconcileTime": _now(),
+        "lastReconcileTime": now_rfc3339(),
         "observedGeneration": meta.get("generation"),
         # A merge patch replaces a list wholesale, so the full set is written
         # every time rather than the one entry that changed.
@@ -144,14 +140,14 @@ def set_status(
     if published_fingerprint is not None:
         status["publishedFingerprint"] = published_fingerprint
     if mark_published:
-        status["lastPublishedTime"] = _now()
+        status["lastPublishedTime"] = now_rfc3339()
     if pending_request is not _UNSET:
         # None clears the field: the merge patch drops a null-valued key.
         status["pendingRequestName"] = pending_request
     if mark_signing:
         # Stamped when a signing round opens, so a round that never converges
         # is throttled instead of rotating the host's key every reconcile.
-        status["lastSigningTime"] = _now()
+        status["lastSigningTime"] = now_rfc3339()
     # Always written, so it is cleared by any outcome that did not schedule a
     # retry: a stale "retrying at" on a publication that has since succeeded
     # would be worse than none at all.

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import base64
-import datetime
 import logging
 import os
 
 from kubernetes import client
 from kubernetes import config as kube_config
 from kubernetes.client.rest import ApiException
+
+from .utils import now_rfc3339
 
 log = logging.getLogger("cert-publisher.kube")
 
@@ -158,7 +159,7 @@ class Kube:
         """
         meta = pub["metadata"]
         namespace = meta["namespace"]
-        stamp = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stamp = now_rfc3339()
         body = {
             "apiVersion": "v1",
             "kind": "Event",

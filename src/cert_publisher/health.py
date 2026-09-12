@@ -82,7 +82,8 @@ class HealthServer:
             def do_GET(self) -> None:  # http.server's spelling, not ours
                 path = self.path.split("?", 1)[0].rstrip("/") or "/"
                 if path == "/healthz":
-                    ok, body = outer._alive(), b"ok\n"
+                    ok = outer._alive()
+                    body = b"ok\n" if ok else b"unhealthy\n"
                 elif path == "/readyz":
                     ok = outer._ready.is_set()
                     body = b"ok\n" if ok else b"starting\n"

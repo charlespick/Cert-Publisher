@@ -72,6 +72,12 @@ controller:
   # How long a shutdown waits for an in-flight publish to finish. Keep
   # terminationGracePeriodSeconds comfortably above this.
   shutdownTimeout: 30
+  # How long a single reconcile may run before the liveness probe treats this
+  # pod as wedged and the kubelet restarts it. A provisioner call that hangs
+  # with no timeout of its own would otherwise hold its worker forever and
+  # starve every publication behind it. Keep it above the slowest legitimate
+  # publish -- an iDRAC import and reset takes minutes.
+  reconcileTimeout: 900
 
 leaderElection:
   # Only the replica holding the Lease reconciles. Disabling this is only safe

@@ -24,12 +24,16 @@ def server():
 
 
 def _get(server, path):
+    return _fetch(server, path)[0]
+
+
+def _fetch(server, path):
     url = f"http://127.0.0.1:{server._port}{path}"
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
-            return response.status
+            return response.status, response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code
+        return exc.code, exc.read()
 
 
 def test_a_fresh_process_is_alive_but_not_yet_ready(server):
@@ -49,7 +53,10 @@ def test_readiness_is_not_gated_on_leadership(server):
 
 def test_a_failing_check_fails_liveness(server):
     server.add_liveness_check(lambda: False)
-    assert _get(server, "/healthz") == 503
+    status, body = _fetch(server, "/healthz")
+    assert status == 503
+    # Anyone curling this while chasing a restart loop reads the body.
+    assert body == b"unhealthy\n"
 
 
 def test_a_check_that_raises_fails_liveness_rather_than_the_probe(server):

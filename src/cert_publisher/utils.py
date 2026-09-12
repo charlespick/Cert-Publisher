@@ -1,4 +1,4 @@
-"""Certificate parsing and fingerprint helpers."""
+"""Certificate parsing, timestamp, and fingerprint helpers."""
 
 from __future__ import annotations
 
@@ -7,6 +7,29 @@ import re
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
+
+# Every timestamp this operator writes to a .status field or an Event uses this
+# layout, and ``parse_rfc3339`` reads back what ``rfc3339`` wrote -- so the
+# format lives in one place rather than in each caller that formats "now".
+_RFC3339 = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def rfc3339(when: datetime.datetime) -> str:
+    return when.astimezone(datetime.UTC).strftime(_RFC3339)
+
+
+def now_rfc3339() -> str:
+    return rfc3339(now_utc())
+
+
+def parse_rfc3339(value: str) -> datetime.datetime:
+    """Parse a timestamp written by :func:`rfc3339`, raising ValueError if not."""
+    return datetime.datetime.strptime(value, _RFC3339).replace(tzinfo=datetime.UTC)
+
 
 _CERT_RE = re.compile(
     rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",

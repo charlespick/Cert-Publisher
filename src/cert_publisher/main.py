@@ -9,7 +9,9 @@ things a controller has to get right:
   the lease reconciles, because publishing a certificate writes to a host and
   must not happen twice.
 * **Shutdown.** SIGTERM stops the queue, lets an in-flight publish finish, and
-  releases the lease so a standby takes over immediately.
+  releases the lease so a standby takes over immediately -- unless a publish
+  was still running when the timeout ran out, in which case the lease is left
+  to expire rather than handed to a replica that would race it.
 * **Exit codes that mean something to a Deployment.** A lost lease exits
   non-zero: a process that believes it is the leader and is not must not stay
   up.
@@ -86,6 +88,7 @@ class OperatorConfig:
             watch_timeout_seconds=_env_int("WATCH_TIMEOUT", 300),
             startup_spread_seconds=_env_float("STARTUP_SPREAD", 60.0),
             shutdown_timeout_seconds=_env_float("SHUTDOWN_TIMEOUT", 30.0),
+            reconcile_timeout_seconds=_env_float("RECONCILE_TIMEOUT", 900.0),
         )
         return cls(
             controller=controller,
@@ -147,9 +150,13 @@ def main() -> int:
         controller.start()
         health.set_leading(True)
 
-    def _stop_leading() -> None:
+    def _stop_leading() -> bool:
+        # Stop first, then stand down: until the last worker is done this pod
+        # is still the one reconciling, and /leader is what an operator reads
+        # to find out which pod that is.
+        drained = controller.stop()
         health.set_leading(False)
-        controller.stop()
+        return drained
 
     # Ready means "wired up and campaigning", not "leading" -- see health.py
     # for why a readiness gate only the leader can pass deadlocks a rollout.

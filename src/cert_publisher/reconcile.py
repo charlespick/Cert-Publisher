@@ -58,8 +58,11 @@ from .status import (
 from .utils import (
     certificate_dns_names,
     leaf_certificate,
+    now_utc,
     parse_go_duration,
+    parse_rfc3339,
     renewal_due,
+    rfc3339,
     sha256_fingerprint,
 )
 
@@ -241,6 +244,9 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     spec_changed = observed is not None and observed != meta.get("generation")
     if not spec_changed and since is not None and since < _SIGNING_COOLDOWN:
         remaining = _SIGNING_COOLDOWN - since
+        # Come back when the cooldown is actually up rather than on the resync,
+        # which could be either side of it.
+        retry_in = remaining + datetime.timedelta(seconds=5)
         log.error("[%s] still needs renewal right after signing: %s", ref, reason)
         set_status(
             kube, pub, ERROR,
@@ -253,10 +259,9 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
             f"the publication retries immediately; so does clearing "
             f".status.lastSigningTime.",
             reason=REASON_SIGNING_COOLDOWN,
+            next_retry=rfc3339(now_utc() + retry_in),
         )
-        # Come back when the cooldown is actually up rather than on the resync,
-        # which could be either side of it.
-        return Result(requeue_after=remaining + datetime.timedelta(seconds=5))
+        return Result(requeue_after=retry_in)
     if spec_changed and since is not None and since < _SIGNING_COOLDOWN:
         log.info("[%s] publication changed; retrying without waiting out the "
                  "signing cooldown", ref)
@@ -271,12 +276,10 @@ def _time_since(stamp: str | None) -> datetime.timedelta | None:
     if not stamp:
         return None
     try:
-        when = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.UTC
-        )
+        when = parse_rfc3339(stamp)
     except ValueError:
         return None
-    return datetime.datetime.now(datetime.UTC) - when
+    return now_utc() - when
 
 
 def _renew_before_problem(installed: bytes | None, spec: dict) -> str | None:

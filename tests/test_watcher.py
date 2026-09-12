@@ -144,6 +144,32 @@ def test_an_expired_watch_relists_immediately_rather_than_backing_off():
     assert len(custom.list_calls) == 2, "did not relist after the watch expired"
 
 
+def test_a_transient_failure_resumes_rather_than_relisting():
+    """Only a 410 means the position is gone. Relisting on anything else pays
+    for a full list and requeues every publication in the cluster for nothing."""
+    custom = _FakeCustom([_pub("web01")], version="55")
+    watcher = _watcher(PUBLICATIONS, custom, [], [], backoff_base_seconds=0.01)
+    stop = threading.Event()
+
+    seen = []
+
+    def _fake_watch_from(resource_version, stop_event):
+        seen.append(resource_version)
+        if len(seen) == 1:
+            raise ApiException(status=500, reason="Internal Server Error")
+        stop.set()
+        return resource_version
+
+    watcher._watch_from = _fake_watch_from
+    thread = threading.Thread(target=watcher._run, args=(stop,), daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert seen == ["55", "55"], "did not resume from the last known position"
+    assert len(custom.list_calls) == 1, "relisted after a transient failure"
+
+
 def test_a_broken_watch_backs_off_before_reconnecting():
     """A watch the apiserver keeps rejecting -- missing RBAC, a missing CRD --
     must not become a hot loop against it."""

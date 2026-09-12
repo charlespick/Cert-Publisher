@@ -1048,6 +1048,25 @@ def test_the_cooldown_message_does_not_claim_an_import_happened(monkeypatch):
     assert "was signed and imported" not in message
 
 
+def test_the_cooldown_says_when_it_will_try_again(monkeypatch):
+    """Every other Error state carries nextRetryTime. The one path that
+    schedules its own requeue must not be the one that leaves it blank."""
+    from cert_publisher.utils import now_utc, parse_rfc3339
+
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv(installed=None))
+
+    result = reconcile_mod.reconcile_publication(
+        kube, _pub(status={"lastSigningTime": _stamp(datetime.timedelta(minutes=-5))})
+    )
+
+    assert result.requeue_after is not None
+    assert kube.status["nextRetryTime"], "scheduled a retry without saying when"
+    # The field and the requeue have to describe the same moment.
+    drift = parse_rfc3339(kube.status["nextRetryTime"]) - (now_utc() + result.requeue_after)
+    assert abs(drift.total_seconds()) < 5
+
+
 # -- first contact with real hardware --------------------------------------
 
 

@@ -1,6 +1,7 @@
 """Leader election: two replicas must never publish to the same host at once."""
 
 import datetime
+import threading
 
 import pytest
 from kubernetes.client import V1Lease, V1LeaseSpec, V1ObjectMeta
@@ -16,6 +17,9 @@ class _FakeLeases:
     def __init__(self):
         self.store: dict[tuple[str, str], V1Lease] = {}
         self.version = 0
+        # Every call's _request_timeout, so a call that could block forever is
+        # visible to the tests rather than only to a partitioned cluster.
+        self.timeouts: list[float | None] = []
 
     def _model(self, namespace, body) -> V1Lease:
         spec = body["spec"]
@@ -34,20 +38,23 @@ class _FakeLeases:
             ),
         )
 
-    def read_namespaced_lease(self, name, namespace):
+    def read_namespaced_lease(self, name, namespace, **kwargs):
+        self.timeouts.append(kwargs.get("_request_timeout"))
         lease = self.store.get((namespace, name))
         if lease is None:
             raise ApiException(status=404, reason="Not Found")
         return lease
 
-    def create_namespaced_lease(self, namespace, body):
+    def create_namespaced_lease(self, namespace, body, **kwargs):
+        self.timeouts.append(kwargs.get("_request_timeout"))
         key = (namespace, body["metadata"]["name"])
         if key in self.store:
             raise ApiException(status=409, reason="Conflict")
         self.store[key] = self._model(namespace, body)
         return self.store[key]
 
-    def replace_namespaced_lease(self, name, namespace, body):
+    def replace_namespaced_lease(self, name, namespace, body, **kwargs):
+        self.timeouts.append(kwargs.get("_request_timeout"))
         key = (namespace, name)
         current = self.store.get(key)
         if current is None:
@@ -216,6 +223,52 @@ def test_releasing_a_lease_someone_else_now_holds_is_a_no_op(monkeypatch):
 
     former.release()
     assert _held_by(api) == "pod-b"
+
+
+def test_an_unfinished_publish_keeps_the_lease_rather_than_handing_it_over():
+    """A worker still talking to a host is exactly who a standby must not race,
+    so the lease is left to expire instead of released."""
+    api = _FakeLeases()
+    holder = _elector(api, "pod-a")
+    stop = threading.Event()
+
+    holder.run(
+        on_started_leading=stop.set,  # win, then immediately shut down
+        on_stopped_leading=lambda: False,  # ...with a publish still in flight
+        stop_event=stop,
+    )
+
+    assert _held_by(api) == "pod-a", "handed over while a host was being written to"
+
+
+def test_a_drained_shutdown_still_hands_over_immediately():
+    api = _FakeLeases()
+    holder = _elector(api, "pod-a")
+    stop = threading.Event()
+
+    holder.run(
+        on_started_leading=stop.set,
+        on_stopped_leading=lambda: True,
+        stop_event=stop,
+    )
+
+    assert _held_by(api) is None
+
+
+# -- bounded calls --------------------------------------------------------
+
+
+def test_every_lease_call_carries_a_request_timeout():
+    """An unbounded renewal can block past the deadline that would have raised
+    LeadershipLost, leaving this replica sure it leads while a standby leads."""
+    api = _FakeLeases()
+    holder = _elector(api, "pod-a")
+    holder.try_acquire_or_renew()  # read (404) + create
+    holder.try_acquire_or_renew()  # read + replace
+    holder.release()
+
+    assert api.timeouts, "no Lease call was made"
+    assert all(timeout == 10.0 for timeout in api.timeouts), api.timeouts
 
 
 # -- configuration --------------------------------------------------------

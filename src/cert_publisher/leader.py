@@ -89,6 +89,11 @@ class LeaderElector:
         self._retry_period = retry_period
         self._labels = labels or {}
         self._release_on_stop = release_on_stop
+        # Every Lease call is bounded by the renew deadline. _hold only checks
+        # that deadline between attempts, so a call that blocks forever -- a
+        # partitioned apiserver, a black-holed connection -- would otherwise
+        # keep this replica believing it leads while a standby takes over.
+        self._request_timeout = renew_deadline
 
         # The lease record as we last saw it, and when we saw it -- on our own
         # monotonic clock. Expiry is judged from that observation, never from
@@ -102,7 +107,7 @@ class LeaderElector:
         self,
         *,
         on_started_leading: Callable[[], None],
-        on_stopped_leading: Callable[[], None],
+        on_stopped_leading: Callable[[], bool | None],
         stop_event: threading.Event,
     ) -> None:
         """Campaign for the lease, then hold it until stopped or lost.
@@ -111,6 +116,12 @@ class LeaderElector:
         any point in the campaign). Raises :class:`LeadershipLost` if the lease
         was held and could not be renewed -- the caller should exit non-zero so
         the pod is restarted rather than linger as a leader that is not one.
+
+        ``on_stopped_leading`` returns False if it could not stop everything it
+        started -- a publish still mid-conversation with a host. The lease is
+        then left to expire rather than released, because handing it to a
+        standby while this process is still writing to a host is the one thing
+        leader election exists to prevent.
         """
         log.info(
             "campaigning for lease %s/%s as %s",
@@ -126,8 +137,15 @@ class LeaderElector:
         try:
             self._hold(stop_event)
         finally:
-            on_stopped_leading()
-            if self._release_on_stop:
+            drained = on_stopped_leading()
+            if drained is False:
+                log.warning(
+                    "not releasing lease %s/%s: a reconcile was still in "
+                    "flight, so the lease is left to expire in about %.0fs "
+                    "rather than handing over while a host is being written to",
+                    self._namespace, self._name, self._lease_duration,
+                )
+            elif self._release_on_stop:
                 self.release()
 
     # -- campaign / renewal ------------------------------------------------
@@ -216,7 +234,10 @@ class LeaderElector:
             },
         }
         try:
-            self._api.replace_namespaced_lease(self._name, self._namespace, body)
+            self._api.replace_namespaced_lease(
+                self._name, self._namespace, body,
+                _request_timeout=self._request_timeout,
+            )
         except ApiException as exc:
             if exc.status == 409:
                 log.debug("lost the race to update lease %s/%s",
@@ -237,7 +258,10 @@ class LeaderElector:
 
     def _read(self):
         try:
-            return self._api.read_namespaced_lease(self._name, self._namespace)
+            return self._api.read_namespaced_lease(
+                self._name, self._namespace,
+                _request_timeout=self._request_timeout,
+            )
         except ApiException as exc:
             if exc.status == 404:
                 return None
@@ -262,7 +286,9 @@ class LeaderElector:
             },
         }
         try:
-            self._api.create_namespaced_lease(self._namespace, body)
+            self._api.create_namespaced_lease(
+                self._namespace, body, _request_timeout=self._request_timeout
+            )
         except ApiException as exc:
             # 409 means another candidate created it first; we campaign again.
             if exc.status != 409:
@@ -308,7 +334,10 @@ class LeaderElector:
                     "leaseTransitions": lease.spec.lease_transitions or 0,
                 },
             }
-            self._api.replace_namespaced_lease(self._name, self._namespace, body)
+            self._api.replace_namespaced_lease(
+                self._name, self._namespace, body,
+                _request_timeout=self._request_timeout,
+            )
             log.info("released lease %s/%s", self._namespace, self._name)
         except Exception:
             log.warning("could not release lease %s/%s; it will expire instead",

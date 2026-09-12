@@ -2,6 +2,8 @@
 event-driven wake-ups, and a resync that does not stampede."""
 
 import datetime
+import threading
+import time
 
 import pytest
 
@@ -241,6 +243,40 @@ def test_healthy_until_a_watch_goes_silent():
     for watcher in ctrl._watchers:
         watcher._last_healthy -= 10_000
     assert not ctrl.healthy()
+
+
+def test_a_wedged_reconcile_fails_liveness():
+    """A provisioner call that never returns holds its worker forever. The
+    CronJob's activeDeadlineSeconds used to be what noticed; now this is."""
+    kube = _FakeKube({})
+    ctrl = _controller(kube, reconcile_timeout_seconds=60.0)
+    ctrl._started = True
+
+    ctrl._in_flight["worker-0"] = ("default/web01", time.monotonic())
+    assert ctrl.healthy(), "a reconcile that has only just started is not wedged"
+
+    ctrl._in_flight["worker-0"] = ("default/web01", time.monotonic() - 3600)
+    assert not ctrl.healthy()
+
+
+def test_stop_reports_a_worker_that_did_not_finish():
+    """Leadership must not be handed on while this is False."""
+    kube = _FakeKube({})
+    ctrl = _controller(kube, shutdown_timeout_seconds=0.1)
+    assert ctrl.stop() is True, "never started, so nothing to drain"
+
+    running, release = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=lambda: (running.set(), release.wait(5)), daemon=True
+    )
+    thread.start()
+    running.wait(1)
+    ctrl._started = True
+    ctrl._threads.append(thread)
+    try:
+        assert ctrl.stop() is False
+    finally:
+        release.set()
 
 
 def test_the_worker_survives_a_bug_in_the_controller(monkeypatch):

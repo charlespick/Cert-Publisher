@@ -32,6 +32,7 @@ reach for a hundred hosts at the same instant.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import random
 import threading
@@ -54,6 +55,7 @@ from .kube import (
 )
 from .reconcile import Result, reconcile_publication
 from .status import ERROR, set_status
+from .utils import now_utc, rfc3339
 from .workqueue import ExponentialBackoff, RateLimitingQueue
 
 log = logging.getLogger("cert-publisher.controller")
@@ -104,6 +106,11 @@ class ControllerConfig:
     #: closes the instant it opens would otherwise be a hot loop against it.
     watch_min_interval_seconds: float = 1.0
     shutdown_timeout_seconds: float = 30.0
+    #: How long one reconcile may run before this process is treated as wedged.
+    #: A provisioner call that hangs with no timeout of its own holds its worker
+    #: forever and starves every publication behind it; the CronJob's
+    #: activeDeadlineSeconds used to bound exactly that, and liveness does now.
+    reconcile_timeout_seconds: float = 900.0
 
 
 class _Watcher:
@@ -127,6 +134,11 @@ class _Watcher:
         # Liveness: when this loop last knew it was connected and current.
         self._last_healthy = time.monotonic()
         self.thread: threading.Thread | None = None
+        # One loop, so one key -- but the jitter and the ceiling are the same
+        # problem the queue's retries have, and the same implementation.
+        self._backoff = ExponentialBackoff(
+            config.backoff_base_seconds, config.backoff_max_seconds
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -153,15 +165,9 @@ class _Watcher:
     def label(self) -> str:
         return self._resource.label
 
-    def rebind(self, on_key, on_sync_key) -> None:
-        """Point the watcher at a fresh queue, as ``Controller.start`` does."""
-        self._on_key = on_key
-        self._on_sync_key = on_sync_key
-
     # -- the loop ----------------------------------------------------------
 
     def _run(self, stop_event: threading.Event) -> None:
-        backoff = self._config.backoff_base_seconds
         resource_version: str | None = None
         while not stop_event.is_set():
             started = time.monotonic()
@@ -170,7 +176,7 @@ class _Watcher:
                     resource_version = self._sync()
                 resource_version = self._watch_from(resource_version, stop_event)
                 self._last_healthy = time.monotonic()
-                backoff = self._config.backoff_base_seconds
+                self._backoff.forget(self._resource.label)
             except ApiException as exc:
                 if exc.status == 410:
                     # The apiserver has compacted past our position. This is
@@ -179,13 +185,14 @@ class _Watcher:
                     log.info("[%s] watch expired; relisting", self._resource.label)
                     resource_version = None
                     continue
+                # Any other failure keeps the position: the apiserver says 410
+                # when it is genuinely gone, so a blip is no reason to pay for
+                # a relist -- which, for publications, requeues the whole fleet.
                 log.warning("[%s] watch failed: %s", self._resource.label, exc.reason)
-                resource_version = None
             except Exception:
                 if stop_event.is_set():
                     break
                 log.exception("[%s] watch failed", self._resource.label)
-                resource_version = None
             else:
                 # A watch that came back instantly -- rather than after the
                 # server-side timeout -- must not be reopened instantly too.
@@ -198,9 +205,8 @@ class _Watcher:
             # Only reached after a failure: wait before reconnecting so a
             # rejected watch (RBAC, a missing CRD) does not hammer the
             # apiserver.
-            if stop_event.wait(backoff):
+            if stop_event.wait(self._backoff.next_backoff(self._resource.label)):
                 break
-            backoff = min(backoff * 2, self._config.backoff_max_seconds)
         log.debug("[%s] watcher stopped", self._resource.label)
 
     def _sync(self) -> str:
@@ -353,6 +359,10 @@ class Controller:
         )
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
+        # What each worker is reconciling and since when, so liveness can tell
+        # a busy worker from one wedged inside a call that never returns.
+        self._in_flight: dict[str, tuple[str, float]] = {}
+        self._in_flight_lock = threading.Lock()
         self._watchers = [
             _Watcher(kube, resource, self._config,
                      on_key=self._queue.add,
@@ -369,14 +379,6 @@ class Controller:
             return
         self._started = True
         self._stop_event.clear()
-        self._queue = RateLimitingQueue(
-            ExponentialBackoff(
-                self._config.backoff_base_seconds,
-                self._config.backoff_max_seconds,
-            )
-        )
-        for watcher in self._watchers:
-            watcher.rebind(self._queue.add, self._enqueue_startup)
         log.info(
             "starting controller: %d worker(s), resync every %.0fs, scope %s",
             self._config.workers, self._config.resync_seconds,
@@ -391,16 +393,20 @@ class Controller:
             thread.start()
             self._threads.append(thread)
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Stop accepting work and let in-flight reconciles finish.
 
         Called on SIGTERM and on losing the lease. A reconcile mid-flight is
         talking to a host over SSH or WS-Man and cannot be interrupted safely,
         so it is given until ``shutdown_timeout_seconds`` -- which is why the
         Deployment's termination grace period is set above that.
+
+        Returns whether every worker finished. A Python thread cannot be
+        forced to stop, so a False here means one is still writing to a host:
+        the caller must not hand leadership on until the lease expires.
         """
         if not self._started:
-            return
+            return True
         log.info("stopping controller")
         self._stop_event.set()
         self._queue.shutdown()
@@ -415,32 +421,47 @@ class Controller:
                         ", ".join(still_running))
         self._threads.clear()
         self._started = False
+        return not still_running
 
     def healthy(self) -> bool:
-        """Whether every watcher is still connected, for the liveness probe.
+        """Whether this process is still doing its job, for the liveness probe.
 
-        A watch that has produced nothing -- not an event, not a timeout, not
-        an error -- for several of its own timeouts is wedged, and no amount of
-        waiting fixes it. Failing liveness restarts the pod, which relists.
+        Two things stop it without stopping the process, and neither is fixed
+        by waiting: a watch that has produced nothing -- not an event, not a
+        timeout, not an error -- for several of its own timeouts, and a
+        reconcile wedged inside a provisioner call that has no timeout of its
+        own. Both starve every publication behind them, so both fail liveness
+        and the kubelet restarts the pod.
         """
         if not self._started:
             return True
-        threshold = self._config.watch_timeout_seconds * 3 + 60
         now = time.monotonic()
+        threshold = self._config.watch_timeout_seconds * 3 + 60
         for watcher in self._watchers:
             if now - watcher.last_healthy > threshold:
                 log.error("[%s] watch has been silent for %.0fs",
                           watcher.label, now - watcher.last_healthy)
                 return False
-        return True
+        with self._in_flight_lock:
+            wedged = [
+                (worker, key, now - since)
+                for worker, (key, since) in self._in_flight.items()
+                if now - since > self._config.reconcile_timeout_seconds
+            ]
+        for worker, key, elapsed in wedged:
+            log.error("[%s] has been reconciling %s for %.0fs", worker, key, elapsed)
+        return not wedged
 
     # -- the worker --------------------------------------------------------
 
     def _work(self) -> None:
+        worker = threading.current_thread().name
         while not self._stop_event.is_set():
             key = self._queue.get(timeout=1.0)
             if key is None:
                 continue
+            with self._in_flight_lock:
+                self._in_flight[worker] = (key, time.monotonic())
             try:
                 self._reconcile(key)
             except Exception:
@@ -449,6 +470,8 @@ class Controller:
                 # worker and with it the publications behind this one.
                 log.exception("[%s] unhandled controller error", key)
             finally:
+                with self._in_flight_lock:
+                    self._in_flight.pop(worker, None)
                 self._queue.done(key)
 
     def _reconcile(self, key: str) -> None:
@@ -488,11 +511,10 @@ class Controller:
         delay = self._queue.add_rate_limited(key)
         attempt = self._queue.failures(key)
         log.info("[%s] attempt %d failed; retrying in %.0fs", key, attempt, delay)
-        retry_at = time.time() + delay
         set_status(
             self._kube, pub, ERROR,
             f"{exc} (attempt {attempt}; retrying in {_pretty(delay)})",
-            next_retry=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(retry_at)),
+            next_retry=rfc3339(now_utc() + datetime.timedelta(seconds=delay)),
         )
 
     def _requeue(self, key: str, result: Result | None) -> None:
