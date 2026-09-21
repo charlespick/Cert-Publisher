@@ -868,6 +868,88 @@ def test_ca_bundle_replaces_the_system_trust_store(monkeypatch):
 # -- review follow-ups: reconcile safety -----------------------------------
 
 
+# -- Ready through a renewal ----------------------------------------------
+
+_READY_TRUE = [{"type": "Ready", "status": "True", "reason": "Published",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"}]
+
+
+def _ready(kube):
+    return next(c for c in kube.status["conditions"] if c["type"] == "Ready")
+
+
+def test_a_routine_renewal_stays_ready_while_it_is_signed(monkeypatch):
+    """The host is still serving a good certificate; an alert on Ready must
+    not fire just because the next one is on its way."""
+    pem = _cert(days_valid=300, age_days=250)
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner",
+                        lambda *a: _FakeProv(installed=pem))
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "publishedFingerprint": sha256_fingerprint(pem), "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == PENDING
+    ready = _ready(kube)
+    assert ready["status"] == "True"
+    assert ready["reason"] == "SigningRequestPending"
+    assert ready["lastTransitionTime"] == "2026-01-01T00:00:00Z"
+
+
+def test_an_expired_certificate_is_not_ready_while_it_is_replaced(monkeypatch):
+    pem = _cert(days_valid=30, age_days=40)
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner",
+                        lambda *a: _FakeProv(installed=pem))
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "publishedFingerprint": sha256_fingerprint(pem), "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == PENDING
+    assert _ready(kube)["status"] == "False"
+
+
+def test_renewal_reason_tells_expiry_from_a_routine_renewal():
+    pem = _cert(days_valid=30, age_days=40)
+    status = {"publishedFingerprint": sha256_fingerprint(pem)}
+    reason = reconcile_mod._renewal_reason(pem, _pub()["spec"], status)
+    assert "expired" in reason
+
+
+@pytest.mark.parametrize("was_ready", ["True", "False"])
+def test_waiting_on_issuance_keeps_whatever_readiness_the_round_began_with(
+    monkeypatch, was_ready
+):
+    kube = _FakeKube(request={"status": {"conditions": []}})
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "conditions": [{"type": "Ready", "status": was_ready}],
+    }))
+
+    assert kube.status["phase"] == PENDING
+    assert _ready(kube)["status"] == was_ready
+
+
+def test_a_signing_round_that_is_never_answered_is_not_ready(monkeypatch):
+    """Readiness carried through a round must not outlive the round."""
+    kube = _FakeKube(request={
+        "metadata": {"creationTimestamp": _stamp(datetime.timedelta(hours=-2))},
+        "status": {"conditions": []},
+    })
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc", "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == ERROR
+    assert _ready(kube)["status"] == "False"
+
+
 def _stamp(delta):
     return (datetime.datetime.now(datetime.UTC) + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 

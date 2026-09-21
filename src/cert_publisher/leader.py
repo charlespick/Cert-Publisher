@@ -41,6 +41,10 @@ class LeadershipLost(RuntimeError):
     """Raised when the lease could not be renewed within the renew deadline."""
 
 
+class _OutOfTime(Exception):
+    """An attempt ran out of renew deadline before its next Lease call."""
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
@@ -93,7 +97,14 @@ class LeaderElector:
         # that deadline between attempts, so a call that blocks forever -- a
         # partitioned apiserver, a black-holed connection -- would otherwise
         # keep this replica believing it leads while a standby takes over.
+        # While holding, each call is further cut to whatever is left of the
+        # deadline, so a read and a write that each block for a full timeout
+        # cannot add up to twice it.
         self._request_timeout = renew_deadline
+        # When the last successful acquire-or-renew *started*, on our own
+        # monotonic clock. The apiserver may have stamped renewTime at any
+        # point after that, so the renew deadline is counted from here.
+        self._renewed_at = time.monotonic()
 
         # The lease record as we last saw it, and when we saw it -- on our own
         # monotonic clock. Expiry is judged from that observation, never from
@@ -159,25 +170,42 @@ class LeaderElector:
         return False
 
     def _hold(self, stop_event: threading.Event) -> None:
-        """Renew the lease until it is given up or lost."""
+        """Renew the lease until it is given up or lost.
+
+        The deadline runs from the start of the last renewal that succeeded,
+        not from the start of this round of retries, and it bounds every call
+        made inside it. A standby starts counting ``leaseDuration`` from the
+        last record it saw, so this replica has to know it has lost the lease
+        within ``renewDeadline`` of that record -- not ``renewDeadline`` after
+        it next got round to trying.
+        """
         while not stop_event.is_set():
-            deadline = time.monotonic() + self._renew_deadline
-            while not self.try_acquire_or_renew():
+            deadline = self._renewed_at + self._renew_deadline
+            while not self.try_acquire_or_renew(deadline=deadline):
                 if stop_event.is_set():
                     return
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise LeadershipLost(
                         f"failed to renew lease {self._namespace}/{self._name} "
                         f"within {self._renew_deadline}s"
                     )
-                stop_event.wait(self._retry_period)
+                stop_event.wait(min(self._retry_period, remaining))
             if stop_event.wait(self._retry_period):
                 return
 
-    def try_acquire_or_renew(self) -> bool:
-        """One acquire-or-renew attempt. Never raises; returns whether we hold it."""
+    def try_acquire_or_renew(self, *, deadline: float | None = None) -> bool:
+        """One acquire-or-renew attempt. Never raises; returns whether we hold it.
+
+        ``deadline`` (on the monotonic clock) bounds the whole attempt, read
+        and write together; an attempt with no time left fails without calling
+        the apiserver at all.
+        """
+        started = time.monotonic()
         try:
-            lease = self._read()
+            lease = self._read(self._timeout(deadline))
+        except _OutOfTime:
+            return False
         except ApiException as exc:
             log.warning("could not read lease %s/%s: %s",
                         self._namespace, self._name, exc.reason)
@@ -187,7 +215,7 @@ class LeaderElector:
             return False
 
         if lease is None:
-            return self._create()
+            return self._create(deadline)
 
         spec = lease.spec
         holder = spec.holder_identity if spec else None
@@ -236,8 +264,10 @@ class LeaderElector:
         try:
             self._api.replace_namespaced_lease(
                 self._name, self._namespace, body,
-                _request_timeout=self._request_timeout,
+                _request_timeout=self._timeout(deadline),
             )
+        except _OutOfTime:
+            return False
         except ApiException as exc:
             if exc.status == 409:
                 log.debug("lost the race to update lease %s/%s",
@@ -252,22 +282,37 @@ class LeaderElector:
 
         self._observed_record = (self._identity, now)
         self._observed_at = time.monotonic()
+        self._renewed_at = started
         return True
 
     # -- API helpers -------------------------------------------------------
 
-    def _read(self):
+    def _timeout(self, deadline: float | None) -> float:
+        """The timeout for one Lease call: the full one, or what is left.
+
+        Raises :class:`_OutOfTime` rather than returning zero or less, which
+        the client would take to mean "no timeout at all".
+        """
+        if deadline is None:
+            return self._request_timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _OutOfTime
+        return min(self._request_timeout, remaining)
+
+    def _read(self, timeout: float | None = None):
         try:
             return self._api.read_namespaced_lease(
                 self._name, self._namespace,
-                _request_timeout=self._request_timeout,
+                _request_timeout=timeout or self._request_timeout,
             )
         except ApiException as exc:
             if exc.status == 404:
                 return None
             raise
 
-    def _create(self) -> bool:
+    def _create(self, deadline: float | None = None) -> bool:
+        started = time.monotonic()
         now = _now()
         body = {
             "apiVersion": _API_VERSION,
@@ -287,8 +332,10 @@ class LeaderElector:
         }
         try:
             self._api.create_namespaced_lease(
-                self._namespace, body, _request_timeout=self._request_timeout
+                self._namespace, body, _request_timeout=self._timeout(deadline)
             )
+        except _OutOfTime:
+            return False
         except ApiException as exc:
             # 409 means another candidate created it first; we campaign again.
             if exc.status != 409:
@@ -300,6 +347,7 @@ class LeaderElector:
             return False
         self._observed_record = (self._identity, now)
         self._observed_at = time.monotonic()
+        self._renewed_at = started
         return True
 
     def release(self) -> None:

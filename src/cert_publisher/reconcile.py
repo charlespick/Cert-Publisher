@@ -53,6 +53,7 @@ from .status import (
     REASON_SIGNING_NOT_SIGNED,
     REASON_SIGNING_PENDING,
     REASON_UNUSABLE_CERTIFICATE,
+    is_ready,
     set_status,
 )
 from .utils import (
@@ -184,6 +185,11 @@ _SIGNING_COOLDOWN = datetime.timedelta(hours=1)
 # waiting on an approver that is never going to answer.
 _REQUEST_TIMEOUT = datetime.timedelta(hours=1)
 
+# The one renewal reason under which the host is still serving a certificate
+# that does its job: ours, covering every name, in date -- just close to the
+# end. A signing round opened for this keeps the publication Ready.
+_ROUTINE_RENEWAL = "the installed certificate is due for renewal"
+
 
 def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     meta = pub["metadata"]
@@ -268,7 +274,9 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
 
     # 4. Have the host mint a CSR and ask cert-manager to sign it.
     log.info("[%s] renewing: %s", ref, reason)
-    return _start_signing(kube, pub, prov, ref, reason)
+    return _start_signing(
+        kube, pub, prov, ref, reason, still_serving=reason == _ROUTINE_RENEWAL
+    )
 
 
 def _time_since(stamp: str | None) -> datetime.timedelta | None:
@@ -338,8 +346,12 @@ def _renewal_reason(installed: bytes | None, spec: dict, status: dict) -> str | 
     if missing:
         return f"the installed certificate does not cover {', '.join(missing)}"
 
-    if renewal_due(cert, renew_before=spec.get("renewBefore")):
-        return "the installed certificate is due for renewal"
+    now = now_utc()
+    if not cert.not_valid_before_utc <= now < cert.not_valid_after_utc:
+        return "the installed certificate is expired or not yet valid"
+
+    if renewal_due(cert, renew_before=spec.get("renewBefore"), now=now):
+        return _ROUTINE_RENEWAL
 
     return None
 
@@ -378,6 +390,7 @@ def _resolve_pending_request(
             "Pending signing request disappeared; a new one will be created",
             reason=REASON_SIGNING_FAILED,
             pending_request=None,
+            ready=is_ready(pub),
         )
         return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
@@ -392,6 +405,7 @@ def _resolve_pending_request(
             f"Signing request failed ({detail}); a new one will be created",
             reason=REASON_SIGNING_FAILED,
             pending_request=None,
+            ready=is_ready(pub),
         )
         return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
@@ -420,6 +434,11 @@ def _resolve_pending_request(
         set_status(
             kube, pub, PENDING, f"Awaiting certificate issuance ({detail})",
             reason=REASON_SIGNING_PENDING,
+            # Whatever the round opened with: Ready if the host is still
+            # serving a good certificate, not if it was broken to begin with.
+            # A round that never finishes is failed after _REQUEST_TIMEOUT,
+            # which clears it either way.
+            ready=is_ready(pub),
         )
         return Result(requeue_after=_AWAITING_ISSUANCE_REQUEUE)
 
@@ -480,8 +499,17 @@ def _already_installed(prov, fingerprint: str) -> bool:
         return False
 
 
-def _start_signing(kube: Kube, pub: dict, prov, ref: str, reason: str) -> Result:
-    """Rotate the host's key, then submit its CSR to cert-manager."""
+def _start_signing(
+    kube: Kube, pub: dict, prov, ref: str, reason: str, *, still_serving: bool = False
+) -> Result:
+    """Rotate the host's key, then submit its CSR to cert-manager.
+
+    ``still_serving`` says the host's current certificate is still good -- a
+    routine renewal, not a repair -- so the publication stays Ready while the
+    new one is signed. This leans on the iDRAC going on serving the old
+    certificate until the signed one is imported -- the same thing the import
+    step relies on when it authenticates the host by its live certificate.
+    """
     meta = pub["metadata"]
     spec = pub["spec"]
     namespace = meta["namespace"]
@@ -506,6 +534,7 @@ def _start_signing(kube: Kube, pub: dict, prov, ref: str, reason: str) -> Result
         f"Signing request submitted ({reason}); awaiting issuance",
         reason=REASON_SIGNING_PENDING,
         pending_request=request_name, mark_signing=True, strict=True,
+        ready=still_serving,
     )
     log.info("[%s] creating CertificateRequest %s", ref, request_name)
     kube.create_certificate_request(

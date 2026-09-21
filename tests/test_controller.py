@@ -196,6 +196,79 @@ def test_a_settled_reconcile_falls_back_to_the_resync_interval(monkeypatch):
     assert len(ctrl.queue) == 1  # but scheduled
 
 
+class _WatchedKube(_FakeKube):
+    """Delivers each status write back as a watch event, as the apiserver does.
+
+    A status-subresource write still bumps the resourceVersion, so a
+    controller watching its own resource hears about every one of its writes.
+    """
+
+    def __init__(self, publications):
+        super().__init__(publications)
+        self.watcher = None
+
+    def patch_publication_status(self, namespace, name, status):
+        super().patch_publication_status(namespace, name, status)
+        pub = self.publications[f"{namespace}/{name}"]
+        self.watcher._handle({"type": "MODIFIED", "object": pub})
+
+
+def _watched_controller(monkeypatch, outcome):
+    kube = _WatchedKube({"default/web01": _pub()})
+    ctrl = _controller(kube)
+    kube.watcher = ctrl._watchers[0]
+    monkeypatch.setattr(controller_mod, "reconcile_publication", outcome)
+    # The initial watch delivers the publication once, which is a real reason
+    # to reconcile it.
+    kube.watcher._handle({"type": "ADDED", "object": kube.publications["default/web01"]})
+    assert ctrl.queue.get(timeout=0.05) == "default/web01"
+    return kube, ctrl
+
+
+def _reconcile_as_a_worker_would(ctrl, key):
+    ctrl._reconcile(key)
+    ctrl.queue.done(key)
+
+
+def test_writing_status_does_not_trigger_another_reconcile(monkeypatch):
+    """Otherwise every reconcile queues the next, and the resync never runs."""
+    def _published(kube, pub):
+        from cert_publisher.status import set_status
+        set_status(kube, pub, PUBLISHED, "Certificate up to date")
+        return Result()
+
+    _, ctrl = _watched_controller(monkeypatch, _published)
+    _reconcile_as_a_worker_would(ctrl, "default/web01")
+    assert ctrl.queue.get(timeout=0.05) is None, "reconciled again off its own status write"
+
+
+def test_a_failure_status_write_does_not_bypass_the_backoff(monkeypatch):
+    """A down host must be retried on the backoff, not hammered in a loop."""
+    _, ctrl = _watched_controller(
+        monkeypatch, lambda *_: (_ for _ in ()).throw(ConnectionError("down")),
+    )
+    _reconcile_as_a_worker_would(ctrl, "default/web01")
+    assert ctrl.queue.get(timeout=0.05) is None, "retried with no backoff at all"
+    assert ctrl.queue.failures("default/web01") == 1
+
+
+def test_editing_the_spec_still_triggers_a_reconcile(monkeypatch):
+    kube, ctrl = _watched_controller(monkeypatch, lambda *_: Result())
+    _reconcile_as_a_worker_would(ctrl, "default/web01")
+
+    edited = kube.publications["default/web01"]
+    edited["metadata"]["generation"] = 2
+    kube.watcher._handle({"type": "MODIFIED", "object": edited})
+    assert ctrl.queue.get(timeout=0.05) == "default/web01"
+
+
+def test_only_the_publications_watcher_seeds_work_on_a_relist():
+    ctrl = _controller(_FakeKube({}))
+    publications, *owned = ctrl._watchers
+    assert publications._on_sync_key == ctrl._enqueue_startup
+    assert all(w._on_sync_key == ctrl.queue.add for w in owned)
+
+
 def test_a_failure_to_read_the_publication_is_retried_not_swallowed():
     class _Unreadable(_FakeKube):
         def get_publication(self, namespace, name):

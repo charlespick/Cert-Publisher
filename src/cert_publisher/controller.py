@@ -129,6 +129,11 @@ class _Watcher:
         self._config = config
         self._on_key = on_key
         self._on_sync_key = on_sync_key or on_key
+        # The last generation seen per publication. Every reconcile writes
+        # .status, and a status write is a MODIFIED event like any other; left
+        # unfiltered, each reconcile would queue the next one, and neither the
+        # resync interval nor the retry backoff would ever get a say.
+        self._generations: dict[str, int] = {}
         self._watch: watch.Watch | None = None
         self._lock = threading.Lock()
         # Liveness: when this loop last knew it was connected and current.
@@ -223,9 +228,11 @@ class _Watcher:
         """
         if self._resource.is_publication:
             items, version = self._list(limit=None)
+            self._generations.clear()
             for item in items:
                 key = _publication_key(item)
                 if key:
+                    self._remember_generation(key, item)
                     self._on_sync_key(key)
             log.info("[%s] synced %d object(s)", self._resource.label, len(items))
         else:
@@ -287,11 +294,35 @@ class _Watcher:
             return  # BOOKMARK and other event shapes carry nothing to map
         if self._resource.is_publication:
             key = _publication_key(obj)
+            if key and not self._spec_changed(event.get("type"), key, obj):
+                log.debug("[%s] %s -> %s: status only; ignored",
+                          self._resource.label, event.get("type"), key)
+                return
         else:
             key = _owning_publication_key(obj)
         if key:
             log.debug("[%s] %s -> %s", self._resource.label, event.get("type"), key)
             self._on_key(key)
+
+    def _spec_changed(self, event_type, key: str, obj: dict) -> bool:
+        """Whether a publication event is anything but our own status write.
+
+        ``metadata.generation`` only moves when the spec does -- the status
+        subresource exists precisely so that writing it does not -- so an
+        unchanged generation means nothing the reconcile reads has changed.
+        """
+        if event_type == "DELETED":
+            self._generations.pop(key, None)
+            return True
+        previous = self._generations.get(key)
+        current = self._remember_generation(key, obj)
+        return current is None or current != previous
+
+    def _remember_generation(self, key: str, obj: dict) -> int | None:
+        generation = (obj.get("metadata") or {}).get("generation")
+        if generation is not None:
+            self._generations[key] = generation
+        return generation
 
     # -- namespaced vs cluster-wide ---------------------------------------
 
@@ -364,10 +395,13 @@ class Controller:
         self._in_flight: dict[str, tuple[str, float]] = {}
         self._in_flight_lock = threading.Lock()
         self._watchers = [
-            _Watcher(kube, resource, self._config,
+            # Only the publications watcher seeds work on a relist; the owned
+            # resources' lists are capped at one item and only read a version.
+            _Watcher(kube, PUBLICATIONS, self._config,
                      on_key=self._queue.add,
-                     on_sync_key=self._enqueue_startup)
-            for resource in (PUBLICATIONS, CERTIFICATES, CERTIFICATE_REQUESTS)
+                     on_sync_key=self._enqueue_startup),
+            *(_Watcher(kube, resource, self._config, on_key=self._queue.add)
+              for resource in (CERTIFICATES, CERTIFICATE_REQUESTS)),
         ]
         self._started = False
 

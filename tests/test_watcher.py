@@ -89,6 +89,44 @@ def test_a_publication_event_queues_that_publication():
     assert keys == ["default/web01"]
 
 
+def _versioned(name, generation):
+    pub = _pub(name)
+    pub["metadata"]["generation"] = generation
+    return pub
+
+
+def test_a_status_only_change_to_a_publication_is_ignored():
+    """Our own status writes arrive as MODIFIED events; reacting to them would
+    make every reconcile queue the next one."""
+    custom = _FakeCustom([_versioned("web01", 3)])
+    keys = []
+    watcher = _watcher(PUBLICATIONS, custom, keys, [])
+    watcher._sync()
+
+    watcher._handle({"type": "MODIFIED", "object": _versioned("web01", 3)})
+    assert keys == []
+
+
+def test_a_spec_change_to_a_publication_is_queued():
+    custom = _FakeCustom([_versioned("web01", 3)])
+    keys = []
+    watcher = _watcher(PUBLICATIONS, custom, keys, [])
+    watcher._sync()
+
+    watcher._handle({"type": "MODIFIED", "object": _versioned("web01", 4)})
+    assert keys == ["default/web01"]
+
+
+def test_a_new_publication_and_a_deleted_one_are_both_queued():
+    keys = []
+    watcher = _watcher(PUBLICATIONS, _FakeCustom(), keys, [])
+    watcher._handle({"type": "ADDED", "object": _versioned("web01", 1)})
+    watcher._handle({"type": "DELETED", "object": _versioned("web01", 1)})
+    # Recreated under the same name: generation starts again at 1.
+    watcher._handle({"type": "ADDED", "object": _versioned("web01", 1)})
+    assert keys == ["default/web01"] * 3
+
+
 def test_an_issued_certificate_queues_the_publication_waiting_on_it():
     keys = []
     watcher = _watcher(CERTIFICATES, _FakeCustom(), keys, [])

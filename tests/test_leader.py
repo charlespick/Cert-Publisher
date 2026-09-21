@@ -271,6 +271,87 @@ def test_every_lease_call_carries_a_request_timeout():
     assert all(timeout == 10.0 for timeout in api.timeouts), api.timeouts
 
 
+class _ClockedStop:
+    """A stop event that is never set, whose waits pass on a fake clock."""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout):
+        self._clock[0] += timeout
+        return False
+
+
+def test_a_blocked_renewal_gives_up_within_the_renew_deadline(monkeypatch):
+    """A read and a write that each hang for a full request timeout must not
+    add up to twice the deadline: a standby may take over 15s after the last
+    renewal it saw, so the holder has to know it has lost within 10s."""
+    clock = [1000.0]
+    monkeypatch.setattr(leader_mod.time, "monotonic", lambda: clock[0])
+    api = _FakeLeases()
+    holder = _elector(api, "pod-a")
+    assert holder.try_acquire_or_renew() is True
+    renewed = clock[0]
+
+    class _Degraded(_FakeLeases):
+        """Reads crawl in just under their timeout; writes never return."""
+
+        def read_namespaced_lease(self, name, namespace, **kwargs):
+            lease = super().read_namespaced_lease(name, namespace, **kwargs)
+            clock[0] += kwargs["_request_timeout"] * 0.99
+            return lease
+
+        def replace_namespaced_lease(self, name, namespace, body, **kwargs):
+            self.timeouts.append(kwargs.get("_request_timeout"))
+            clock[0] += kwargs["_request_timeout"]
+            raise TimeoutError("read timed out")
+
+    degraded = _Degraded()
+    degraded.store, degraded.version = api.store, api.version
+    holder._api = degraded
+    with pytest.raises(leader_mod.LeadershipLost):
+        holder._hold(_ClockedStop(clock))
+
+    assert clock[0] - renewed <= 10.0, (
+        f"believed it led for {clock[0] - renewed:.1f}s after its last renewal"
+    )
+    assert all(0 < timeout <= 10.0 for timeout in holder._api.timeouts)
+
+
+def test_a_slow_read_leaves_the_write_only_what_is_left(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(leader_mod.time, "monotonic", lambda: clock[0])
+
+    class _SlowRead(_FakeLeases):
+        def read_namespaced_lease(self, name, namespace, **kwargs):
+            lease = super().read_namespaced_lease(name, namespace, **kwargs)
+            clock[0] += 7.0
+            return lease
+
+    api = _SlowRead()
+    holder = _elector(api, "pod-a")
+    holder.try_acquire_or_renew()  # read (404) + create
+    api.timeouts.clear()
+
+    assert holder.try_acquire_or_renew(deadline=clock[0] + 10.0) is True
+    assert api.timeouts == [10.0, 3.0]
+
+
+def test_an_attempt_with_no_time_left_does_not_call_the_apiserver(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(leader_mod.time, "monotonic", lambda: clock[0])
+    api = _FakeLeases()
+    holder = _elector(api, "pod-a")
+    holder.try_acquire_or_renew()
+    api.timeouts.clear()
+
+    assert holder.try_acquire_or_renew(deadline=clock[0]) is False
+    assert api.timeouts == []
+
+
 # -- configuration --------------------------------------------------------
 
 

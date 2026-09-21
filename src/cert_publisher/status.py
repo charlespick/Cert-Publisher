@@ -62,8 +62,20 @@ _MAX_MESSAGE = 32 * 1024
 _UNSET = object()
 
 
-def _ready_condition(pub: dict, phase: str, reason: str, message: str) -> dict:
+def is_ready(pub: dict) -> bool:
+    """Whether the publication's stored ``Ready`` condition is True."""
+    current = (pub.get("status") or {}).get("conditions") or []
+    return any(c.get("type") == READY and c.get("status") == "True" for c in current)
+
+
+def _ready_condition(
+    pub: dict, phase: str, reason: str, message: str, ready: bool | None = None
+) -> dict:
     """The ``Ready`` condition for this outcome, merged onto the current one.
+
+    Ready follows the phase unless ``ready`` says otherwise: a routine renewal
+    is Pending while the host goes on serving a perfectly good certificate,
+    and an alert on Ready should not fire for that.
 
     ``lastTransitionTime`` is carried over while the answer is unchanged: it
     marks when the publication *became* ready or unready, which is the whole
@@ -73,7 +85,9 @@ def _ready_condition(pub: dict, phase: str, reason: str, message: str) -> dict:
     current = (pub.get("status") or {}).get("conditions") or []
     existing = next((c for c in current if c.get("type") == READY), None)
 
-    state = "True" if phase == PUBLISHED else "False"
+    if ready is None:
+        ready = phase == PUBLISHED
+    state = "True" if ready else "False"
     if existing and existing.get("status") == state:
         transitioned = existing.get("lastTransitionTime") or now_rfc3339()
     else:
@@ -110,6 +124,7 @@ def set_status(
     pending_request: str | None | object = _UNSET,
     mark_signing: bool = False,
     next_retry: str | None = None,
+    ready: bool | None = None,
     strict: bool = False,
 ) -> None:
     """Patch ``.status`` for a publication.
@@ -126,7 +141,7 @@ def set_status(
     reason = reason or _DEFAULT_REASONS.get(phase, phase)
     previous = pub.get("status") or {}
 
-    condition = _ready_condition(pub, phase, reason, message)
+    condition = _ready_condition(pub, phase, reason, message, ready)
     status: dict = {
         "phase": phase,
         "message": message,
