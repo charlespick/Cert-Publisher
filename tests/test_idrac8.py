@@ -744,6 +744,72 @@ def test_reconcile_recovers_when_the_pending_request_vanished(monkeypatch):
     assert kube.status["phase"] == PENDING
 
 
+@pytest.mark.parametrize("request_obj", [
+    None,  # vanished
+    {"status": {"conditions": [{"type": "Denied", "status": "True", "message": "no"}]}},
+], ids=["vanished", "denied"])
+def test_a_restarted_round_inside_the_cooldown_says_when_it_will_actually_run(
+    monkeypatch, request_obj
+):
+    """The next round is held by the signing cooldown, so a promise to retry
+    in seconds would be false: the retry is scheduled, and reported, for when
+    the cooldown ends."""
+    kube = _FakeKube(request=request_obj)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": _stamp(datetime.timedelta(minutes=-10)),
+    }))
+
+    assert datetime.timedelta(minutes=49) < result.requeue_after <= datetime.timedelta(
+        minutes=51
+    )
+    assert "signing cooldown ends in" in kube.status["message"]
+    retry_at = datetime.datetime.strptime(
+        kube.status["nextRetryTime"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=datetime.UTC)
+    assert retry_at - datetime.datetime.now(datetime.UTC) > datetime.timedelta(minutes=49)
+
+
+def test_a_restarted_round_past_the_cooldown_retries_straight_away(monkeypatch):
+    kube = _FakeKube(request=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": _stamp(datetime.timedelta(hours=-2)),
+    }))
+
+    assert result.requeue_after == datetime.timedelta(seconds=5)
+    assert "cooldown" not in kube.status["message"]
+
+
+def test_the_scheduled_retry_really_does_open_a_new_round(monkeypatch):
+    """Where the old code promised a 5s retry and then hit the cooldown."""
+    kube = _FakeKube(request=None)
+    prov = _FakeProv(installed=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: prov)
+    signed_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=10)
+    pub = _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": signed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+    # set_status keeps pub["status"] merged the way the apiserver would, so
+    # lastSigningTime survives into the next pass exactly as it would live.
+    result = reconcile_mod.reconcile_publication(kube, pub)
+    assert pub["status"]["lastSigningTime"]
+
+    # Move the clock to when the retry was scheduled for.
+    later = datetime.datetime.now(datetime.UTC) + result.requeue_after
+    monkeypatch.setattr(reconcile_mod, "now_utc", lambda: later)
+    reconcile_mod.reconcile_publication(kube, pub)
+
+    assert prov.csr_args is not None, "the scheduled retry still hit the cooldown"
+    assert kube.status["phase"] == PENDING
+
+
 def test_reconcile_keeps_the_request_when_the_import_fails(monkeypatch):
     """A failed import must not rotate the host key for a fresh CSR next run."""
     signed = _cert()

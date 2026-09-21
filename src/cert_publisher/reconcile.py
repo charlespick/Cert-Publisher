@@ -76,9 +76,9 @@ log = logging.getLogger("cert-publisher.reconcile")
 _AWAITING_ISSUANCE_REQUEUE = datetime.timedelta(minutes=2)
 
 # How soon to look again after clearing a signing request that cannot be used
-# (vanished, or rejected). The next pass opens a fresh round, so there is no
-# reason to make it wait -- but it goes through the queue rather than looping
-# here, so it is still subject to the queue's ordering and shutdown.
+# (vanished, rejected, or never answered), when the signing cooldown does not
+# stand in the way. It goes through the queue rather than looping here, so it
+# is still subject to the queue's ordering and shutdown.
 _RESTART_SIGNING_REQUEUE = datetime.timedelta(seconds=5)
 
 
@@ -242,14 +242,13 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     #    is an operator saying "I've addressed that", and making them wait out
     #    a rate limit aimed at runaway retries would be the wrong answer to a
     #    deliberate act.
-    since = _time_since(status.get("lastSigningTime"))
+    remaining = _signing_cooldown_remaining(status)
     # Absent observedGeneration means we cannot tell whether the spec moved, so
     # keep the rate limit: it exists to stop repeated BMC reboots, and the safe
     # default when uncertain is to hold rather than retry.
     observed = status.get("observedGeneration")
     spec_changed = observed is not None and observed != meta.get("generation")
-    if not spec_changed and since is not None and since < _SIGNING_COOLDOWN:
-        remaining = _SIGNING_COOLDOWN - since
+    if not spec_changed and remaining is not None:
         # Come back when the cooldown is actually up rather than on the resync,
         # which could be either side of it.
         retry_in = remaining + datetime.timedelta(seconds=5)
@@ -268,7 +267,7 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
             next_retry=rfc3339(now_utc() + retry_in),
         )
         return Result(requeue_after=retry_in)
-    if spec_changed and since is not None and since < _SIGNING_COOLDOWN:
+    if spec_changed and remaining is not None:
         log.info("[%s] publication changed; retrying without waiting out the "
                  "signing cooldown", ref)
 
@@ -374,6 +373,55 @@ def _unusable_signed_certificate(cert_pem: bytes, spec: dict) -> str | None:
     return None
 
 
+def _restart_signing(kube: Kube, pub: dict, message: str, *, reason: str) -> Result:
+    """Clear an unusable signing request and say when the next round opens.
+
+    The next round is subject to the signing cooldown like any other, and it
+    should be: a request that vanished or was denied is exactly how a round
+    fails to converge, and opening a new one at once would rotate the host's
+    key in a loop against an approver that keeps saying no. So the requeue
+    and the status both name the time the cooldown actually allows, rather
+    than promising a retry the next pass would refuse.
+
+    The ``spec_changed`` escape in :func:`_reconcile_host_keyed` does not
+    survive this status write -- it records the current generation -- so it
+    is not counted on here; an edit made after this still bypasses the
+    cooldown, because that edit moves the generation again.
+    """
+    remaining = _signing_cooldown_remaining(pub.get("status") or {})
+    if remaining is None:
+        delay = _RESTART_SIGNING_REQUEUE
+        message = f"{message}; a new one will be created"
+    else:
+        delay = remaining + datetime.timedelta(seconds=5)
+        message = (
+            f"{message}; a new one will be created when the signing cooldown "
+            f"ends in {_round_duration(remaining)}. Editing the publication "
+            f"retries immediately; so does clearing .status.lastSigningTime."
+        )
+    set_status(
+        kube, pub, PENDING, message,
+        reason=reason,
+        pending_request=None,
+        next_retry=rfc3339(now_utc() + delay),
+        ready=is_ready(pub),
+    )
+    return Result(requeue_after=delay)
+
+
+def _signing_cooldown_remaining(status: dict) -> datetime.timedelta | None:
+    """How long until a new signing round may open, or None if it may now."""
+    since = _time_since(status.get("lastSigningTime"))
+    if since is None or since >= _SIGNING_COOLDOWN:
+        return None
+    return _SIGNING_COOLDOWN - since
+
+
+def _round_duration(delta: datetime.timedelta) -> datetime.timedelta:
+    """``delta`` to the whole second, for a message a person reads."""
+    return datetime.timedelta(seconds=round(delta.total_seconds()))
+
+
 def _resolve_pending_request(
     kube: Kube, pub: dict, prov, pending: str, ref: str
 ) -> Result:
@@ -385,14 +433,10 @@ def _resolve_pending_request(
     request = kube.get_certificate_request(namespace, pending)
     if request is None:
         log.warning("[%s] pending CertificateRequest %s is gone; will retry", ref, pending)
-        set_status(
-            kube, pub, PENDING,
-            "Pending signing request disappeared; a new one will be created",
+        return _restart_signing(
+            kube, pub, "Pending signing request disappeared",
             reason=REASON_SIGNING_FAILED,
-            pending_request=None,
-            ready=is_ready(pub),
         )
-        return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
     state, detail = certificate_request_state(request)
     if state == CR_FAILED:
@@ -400,14 +444,10 @@ def _resolve_pending_request(
         # never be retried in place; drop it and start over next run.
         log.error("[%s] signing request %s failed: %s", ref, pending, detail)
         kube.delete_certificate_request(namespace, pending)
-        set_status(
-            kube, pub, PENDING,
-            f"Signing request failed ({detail}); a new one will be created",
+        return _restart_signing(
+            kube, pub, f"Signing request failed ({detail})",
             reason=REASON_SIGNING_FAILED,
-            pending_request=None,
-            ready=is_ready(pub),
         )
-        return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
 
     if state != CR_READY:
         age = _time_since(
