@@ -367,6 +367,28 @@ def test_stop_reports_a_worker_that_did_not_finish():
         release.set()
 
 
+def test_an_interrupted_shutdown_names_the_publications_it_cut_off(caplog):
+    """The write is lost when the process exits; whoever reads the logs needs
+    to know which host to go and look at."""
+    ctrl = _controller(_FakeKube({}), shutdown_timeout_seconds=0.1)
+    running, release = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=lambda: (running.set(), release.wait(5)),
+        name="worker-0", daemon=True,
+    )
+    thread.start()
+    running.wait(1)
+    ctrl._started = True
+    ctrl._threads.append(thread)
+    ctrl._in_flight["worker-0"] = ("default/idrac01", time.monotonic())
+    try:
+        with caplog.at_level("ERROR", logger="cert-publisher.controller"):
+            ctrl.stop()
+    finally:
+        release.set()
+    assert "default/idrac01" in caplog.text
+
+
 def test_the_worker_survives_a_bug_in_the_controller(monkeypatch):
     """A worker that dies takes every publication behind it with it."""
     kube = _FakeKube({"default/web01": _pub()})

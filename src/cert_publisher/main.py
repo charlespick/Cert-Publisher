@@ -14,7 +14,9 @@ things a controller has to get right:
   to expire rather than handed to a replica that would race it.
 * **Exit codes that mean something to a Deployment.** A lost lease exits
   non-zero: a process that believes it is the leader and is not must not stay
-  up.
+  up. So does a shutdown that timed out with a reconcile still writing to a
+  host, so the interruption is on the pod's termination state, not only in
+  its logs.
 """
 
 from __future__ import annotations
@@ -126,6 +128,19 @@ def _identity() -> str:
     return f"{os.environ.get('POD_NAME') or socket.gethostname()}_{uuid.uuid4()}"
 
 
+def _shutdown_code(drained: bool) -> int:
+    """Exit status for a shutdown we asked for: non-zero if it cut a write off.
+
+    The pod is going away either way, so nothing restarts on this; it is there
+    so the interruption shows in the pod's last termination state rather than
+    only in its logs.
+    """
+    if drained:
+        return 0
+    log.error("exiting with a reconcile interrupted mid-write")
+    return 1
+
+
 def main() -> int:
     _setup_logging()
     config = OperatorConfig.from_env()
@@ -150,12 +165,17 @@ def main() -> int:
         controller.start()
         health.set_leading(True)
 
+    # Whether every reconcile finished before shutdown. One that did not is
+    # cut off when the process exits, so the exit code says so.
+    clean = [True]
+
     def _stop_leading() -> bool:
         # Stop first, then stand down: until the last worker is done this pod
         # is still the one reconciling, and /leader is what an operator reads
         # to find out which pod that is.
         drained = controller.stop()
         health.set_leading(False)
+        clean[0] = clean[0] and drained
         return drained
 
     # Ready means "reached the apiserver and campaigning", not "leading" --
@@ -173,7 +193,7 @@ def main() -> int:
             _start_leading()
             stop_event.wait()
             _stop_leading()
-            return 0
+            return _shutdown_code(clean[0])
 
         elector = LeaderElector(
             kube.coordination,
@@ -191,7 +211,7 @@ def main() -> int:
             stop_event=stop_event,
             on_reachable=lambda: health.set_ready(True),
         )
-        return 0
+        return _shutdown_code(clean[0])
     except LeadershipLost as exc:
         # Exit non-zero so the Deployment restarts us: a replica that has lost
         # the lease has to go back to being a standby, and the cheapest way to

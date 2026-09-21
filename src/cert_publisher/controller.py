@@ -457,8 +457,20 @@ class Controller:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         still_running = [t.name for t in self._threads if t.is_alive()]
         if still_running:
-            log.warning("worker(s) still reconciling at shutdown: %s",
-                        ", ".join(still_running))
+            with self._in_flight_lock:
+                interrupted = sorted(
+                    key for worker, (key, _) in self._in_flight.items()
+                    if worker in still_running
+                )
+            # Error, not warning: when the process exits these writes are cut
+            # off wherever they are. The next leader reconciles them again,
+            # but a host caught mid-import is worth a human looking at.
+            log.error(
+                "shutdown timed out after %.0fs with %d reconcile(s) still "
+                "writing to a host; they will be interrupted: %s",
+                self._config.shutdown_timeout_seconds, len(still_running),
+                ", ".join(interrupted) or ", ".join(still_running),
+            )
         self._threads.clear()
         self._started = False
         return not still_running
