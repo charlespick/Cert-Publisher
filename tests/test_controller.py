@@ -318,6 +318,21 @@ def test_healthy_until_a_watch_goes_silent():
     assert not ctrl.healthy()
 
 
+def test_a_standby_that_wins_the_lease_late_is_not_already_overdue(monkeypatch):
+    """Watchers are built at boot; a standby may campaign for hours before it
+    starts them, and must not fail liveness the moment it does."""
+    ctrl = _controller(_FakeKube({}))
+    for watcher in ctrl._watchers:
+        watcher._last_healthy -= 10_000  # built long ago
+        monkeypatch.setattr(watcher, "_run", lambda stop_event: stop_event.wait())
+
+    ctrl.start()
+    try:
+        assert ctrl.healthy()
+    finally:
+        ctrl.stop()
+
+
 def test_a_wedged_reconcile_fails_liveness():
     """A provisioner call that never returns holds its worker forever. The
     CronJob's activeDeadlineSeconds used to be what noticed; now this is."""

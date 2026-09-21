@@ -158,12 +158,14 @@ def main() -> int:
         health.set_leading(False)
         return drained
 
-    # Ready means "wired up and campaigning", not "leading" -- see health.py
-    # for why a readiness gate only the leader can pass deadlocks a rollout.
-    health.set_ready(True)
-
+    # Ready means "reached the apiserver and campaigning", not "leading" --
+    # see health.py for why a readiness gate only the leader can pass
+    # deadlocks a rollout. It waits for the first Lease read, though, so a pod
+    # with broken credentials or RBAC does not pass readiness and let a
+    # rolling update replace a working pod with it.
     try:
         if not config.leader_election:
+            health.set_ready(True)
             log.warning(
                 "leader election is disabled; run exactly one replica, or two "
                 "will publish to the same hosts at the same time"
@@ -187,6 +189,7 @@ def main() -> int:
             on_started_leading=_start_leading,
             on_stopped_leading=_stop_leading,
             stop_event=stop_event,
+            on_reachable=lambda: health.set_ready(True),
         )
         return 0
     except LeadershipLost as exc:

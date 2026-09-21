@@ -10,7 +10,8 @@ so the same information has to be reachable over HTTP:
     relists.
 
 ``/readyz``
-    Is this process wired up and campaigning for the lease? Deliberately *not*
+    Has this process reached the apiserver -- read the Lease at least once --
+    and is it campaigning? Deliberately *not*
     "is it the leader": a rolling update replaces pods one at a time and waits
     for each to become ready, so a readiness gate that only the leader can pass
     deadlocks the moment there is more than one replica -- the new pod waits

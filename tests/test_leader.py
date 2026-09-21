@@ -255,6 +255,57 @@ def test_a_drained_shutdown_still_hands_over_immediately():
     assert _held_by(api) is None
 
 
+def test_reachable_is_reported_once_the_lease_has_been_read():
+    """Readiness waits for this, so a pod that cannot reach the apiserver
+    does not pass it and let a rollout replace a working pod."""
+    api = _FakeLeases()
+    _elector(api, "pod-a").try_acquire_or_renew()  # someone else leads
+    calls = []
+    stop = threading.Event()
+
+    standby = _elector(api, "pod-b")
+    original = standby.try_acquire_or_renew
+
+    def _once_then_stop(**kwargs):
+        result = original(**kwargs)
+        stop.set()
+        return result
+
+    standby.try_acquire_or_renew = _once_then_stop
+    standby.run(
+        on_started_leading=lambda: pytest.fail("stole a live lease"),
+        on_stopped_leading=lambda: True,
+        stop_event=stop,
+        on_reachable=lambda: calls.append("reachable"),
+    )
+    assert calls == ["reachable"]
+
+
+def test_an_unreachable_apiserver_is_never_reported_reachable():
+    class _Down(_FakeLeases):
+        def read_namespaced_lease(self, name, namespace, **kwargs):
+            raise ApiException(status=403, reason="Forbidden")
+
+    calls = []
+    stop = threading.Event()
+    elector = _elector(_Down(), "pod-a")
+    original = elector.try_acquire_or_renew
+
+    def _once_then_stop(**kwargs):
+        result = original(**kwargs)
+        stop.set()
+        return result
+
+    elector.try_acquire_or_renew = _once_then_stop
+    elector.run(
+        on_started_leading=lambda: None,
+        on_stopped_leading=lambda: True,
+        stop_event=stop,
+        on_reachable=lambda: calls.append("reachable"),
+    )
+    assert calls == []
+
+
 # -- bounded calls --------------------------------------------------------
 
 

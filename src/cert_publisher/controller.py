@@ -14,8 +14,10 @@ issuance, act in seconds rather than on the next half-hour tick.
 
 **A work queue decides who runs what.** Keys are deduplicated, and a key in
 flight is never handed to a second worker, so a storm of events for one
-publication is one reconcile and two workers never talk to the same target
-host at the same time.
+publication is one reconcile and two workers never reconcile the same
+publication at once. That serialises by *publication*, not by host: two
+CertPublications pointed at the same machine can still be reconciled side
+by side.
 
 **Failure is per-publication, not per-process.** A reconcile that raises marks
 that publication's status and requeues it with exponential backoff. One
@@ -148,6 +150,10 @@ class _Watcher:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self, stop_event: threading.Event) -> None:
+        # The silence clock starts now, not at construction: a standby builds
+        # its watchers at boot and may campaign for hours before it starts
+        # them, and must not win the lease already looking hours overdue.
+        self._last_healthy = time.monotonic()
         self.thread = threading.Thread(
             target=self._run, args=(stop_event,),
             name=f"watch-{self._resource.plural}", daemon=True,

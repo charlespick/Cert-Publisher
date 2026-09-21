@@ -10,7 +10,9 @@ drives slow, external hosts:
   collapses into a single reconcile.
 * **Per-key serialisation.** A key handed out by :meth:`WorkQueue.get` is not
   handed out again until :meth:`WorkQueue.done`, so two workers never reconcile
-  the same publication (and never talk to the same target host) at once. A key
+  the same publication at once. (Keys are publications, not hosts: two
+  publications that target one machine are not serialised against each
+  other.) A key
   re-added while it is being processed is remembered and requeued on ``done``,
   so an event that races a reconcile is neither lost nor run concurrently.
 * **Delayed adds.** :meth:`WorkQueue.add_after` schedules a key for later

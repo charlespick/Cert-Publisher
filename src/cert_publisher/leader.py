@@ -111,6 +111,7 @@ class LeaderElector:
         # the timestamp in the record, which was written by another process.
         self._observed_record: tuple[str | None, datetime.datetime | None] | None = None
         self._observed_at = time.monotonic()
+        self._on_reachable: Callable[[], None] | None = None
 
     # -- public API --------------------------------------------------------
 
@@ -120,6 +121,7 @@ class LeaderElector:
         on_started_leading: Callable[[], None],
         on_stopped_leading: Callable[[], bool | None],
         stop_event: threading.Event,
+        on_reachable: Callable[[], None] | None = None,
     ) -> None:
         """Campaign for the lease, then hold it until stopped or lost.
 
@@ -133,7 +135,13 @@ class LeaderElector:
         then left to expire rather than released, because handing it to a
         standby while this process is still writing to a host is the one thing
         leader election exists to prevent.
+
+        ``on_reachable`` is called once, the first time the Lease is read (or
+        found missing): the earliest point at which this replica has shown it
+        can reach the apiserver with working credentials and RBAC, and so can
+        take over if it wins.
         """
+        self._on_reachable = on_reachable
         log.info(
             "campaigning for lease %s/%s as %s",
             self._namespace, self._name, self._identity,
@@ -213,6 +221,13 @@ class LeaderElector:
         except Exception:
             log.exception("could not read lease %s/%s", self._namespace, self._name)
             return False
+
+        if self._on_reachable is not None:
+            callback, self._on_reachable = self._on_reachable, None
+            try:
+                callback()
+            except Exception:
+                log.exception("on_reachable callback raised")
 
         if lease is None:
             return self._create(deadline)
