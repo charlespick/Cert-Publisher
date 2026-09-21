@@ -122,19 +122,24 @@ class LeaderElector:
         on_stopped_leading: Callable[[], bool | None],
         stop_event: threading.Event,
         on_reachable: Callable[[], None] | None = None,
+        on_lost_leading: Callable[[LeadershipLost], None] | None = None,
     ) -> None:
         """Campaign for the lease, then hold it until stopped or lost.
 
         Returns normally when ``stop_event`` is set (a graceful shutdown, at
-        any point in the campaign). Raises :class:`LeadershipLost` if the lease
-        was held and could not be renewed -- the caller should exit non-zero so
-        the pod is restarted rather than linger as a leader that is not one.
+        any point in the campaign). The lease is renewed for as long as
+        ``on_stopped_leading`` takes to drain, so a standby cannot take over
+        while a worker is still writing to a host. ``on_stopped_leading``
+        returns False if it gave up on a worker; the lease is then not
+        released, and the caller must exit promptly so that worker dies before
+        the lease can expire.
 
-        ``on_stopped_leading`` returns False if it could not stop everything it
-        started -- a publish still mid-conversation with a host. The lease is
-        then left to expire rather than released, because handing it to a
-        standby while this process is still writing to a host is the one thing
-        leader election exists to prevent.
+        Losing the lease is different: this replica can no longer keep a
+        standby out, so there is no waiting for workers at all.
+        ``on_lost_leading`` is called at once -- from the renewal thread, if
+        the lease is lost mid-drain -- and should end the process, killing any
+        write in progress rather than letting it race the next leader. If it
+        returns, :class:`LeadershipLost` is raised to the caller.
 
         ``on_reachable`` is called once, the first time the Lease is read (or
         found missing): the earliest point at which this replica has shown it
@@ -155,17 +160,59 @@ class LeaderElector:
         on_started_leading()
         try:
             self._hold(stop_event)
-        finally:
+        except LeadershipLost as exc:
+            if on_lost_leading is not None:
+                on_lost_leading(exc)
+            raise
+
+        drained, lost = self._drain_while_holding(on_stopped_leading, on_lost_leading)
+        if lost is not None:
+            raise lost
+        if drained is False:
+            log.warning(
+                "not releasing lease %s/%s: a reconcile was still in flight "
+                "when the drain timed out; it dies with this process, and the "
+                "lease expires about %.0fs after that",
+                self._namespace, self._name, self._lease_duration,
+            )
+        elif self._release_on_stop:
+            self.release()
+
+    def _drain_while_holding(
+        self,
+        on_stopped_leading: Callable[[], bool | None],
+        on_lost_leading: Callable[[LeadershipLost], None] | None,
+    ) -> tuple[bool | None, LeadershipLost | None]:
+        """Run ``on_stopped_leading`` with the lease still being renewed.
+
+        A drain can take longer than a lease -- that is what the shutdown
+        timeout is for -- and a lease left unrenewed for it would expire under
+        the very worker the drain is waiting on.
+        """
+        finished = threading.Event()
+        lost: list[LeadershipLost] = []
+
+        def _keep_renewing() -> None:
+            try:
+                self._hold(finished)
+            except LeadershipLost as exc:
+                lost.append(exc)
+                log.error("lost lease %s/%s while draining: %s",
+                          self._namespace, self._name, exc)
+                if on_lost_leading is not None:
+                    on_lost_leading(exc)
+
+        renewer = threading.Thread(
+            target=_keep_renewing, name="lease-renewer", daemon=True
+        )
+        renewer.start()
+        try:
             drained = on_stopped_leading()
-            if drained is False:
-                log.warning(
-                    "not releasing lease %s/%s: a reconcile was still in "
-                    "flight, so the lease is left to expire in about %.0fs "
-                    "rather than handing over while a host is being written to",
-                    self._namespace, self._name, self._lease_duration,
-                )
-            elif self._release_on_stop:
-                self.release()
+        finally:
+            finished.set()
+            # At most one Lease call in flight, and each is bounded.
+            renewer.join(timeout=self._request_timeout + self._retry_period)
+        return drained, (lost[0] if lost else None)
 
     # -- campaign / renewal ------------------------------------------------
 

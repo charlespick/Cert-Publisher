@@ -443,7 +443,8 @@ class Controller:
 
         Returns whether every worker finished. A Python thread cannot be
         forced to stop, so a False here means one is still writing to a host:
-        the caller must not hand leadership on until the lease expires.
+        the caller must not release the lease, and must end the process before
+        the lease can expire, so the worker dies before a successor starts.
         """
         if not self._started:
             return True

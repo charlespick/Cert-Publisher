@@ -8,15 +8,17 @@ things a controller has to get right:
 * **Leader election.** Every replica starts and campaigns; only the one holding
   the lease reconciles, because publishing a certificate writes to a host and
   must not happen twice.
-* **Shutdown.** SIGTERM stops the queue, lets an in-flight publish finish, and
-  releases the lease so a standby takes over immediately -- unless a publish
-  was still running when the timeout ran out, in which case the lease is left
-  to expire rather than handed to a replica that would race it.
+* **Shutdown.** SIGTERM stops the queue and lets an in-flight publish finish,
+  renewing the lease the whole time so no standby can start on the same host
+  meanwhile; then it releases the lease so a standby takes over immediately.
+  If a publish is still running when the timeout runs out, the lease is kept
+  and the process exits at once, so the write dies well before the lease
+  can expire.
 * **Exit codes that mean something to a Deployment.** A lost lease exits
-  non-zero: a process that believes it is the leader and is not must not stay
-  up. So does a shutdown that timed out with a reconcile still writing to a
-  host, so the interruption is on the pod's termination state, not only in
-  its logs.
+  non-zero, immediately and without draining: once a standby may take over,
+  a worker still writing to a host would be racing it. A shutdown that timed
+  out with a reconcile still writing to a host also exits non-zero, so the
+  interruption is on the pod's termination state, not only in its logs.
 """
 
 from __future__ import annotations
@@ -128,6 +130,19 @@ def _identity() -> str:
     return f"{os.environ.get('POD_NAME') or socket.gethostname()}_{uuid.uuid4()}"
 
 
+def _hard_exit(code: int) -> None:
+    """End the process now, taking every worker thread down with it.
+
+    ``sys.exit`` would unwind this thread and then wait out interpreter
+    shutdown -- atexit hooks, the client's connection pools -- while a worker
+    thread is still writing to a host. When the lease is gone, or about to
+    be, those writes have to stop before a standby's can start, so the logs
+    are flushed and the process ends without ceremony.
+    """
+    logging.shutdown()
+    os._exit(code)
+
+
 def _shutdown_code(drained: bool) -> int:
     """Exit status for a shutdown we asked for: non-zero if it cut a write off.
 
@@ -178,6 +193,15 @@ def main() -> int:
         clean[0] = clean[0] and drained
         return drained
 
+    def _lost_leading(exc: LeadershipLost) -> None:
+        # No drain: a standby may take over within leaseDuration of our last
+        # renewal, and a worker still writing to a host then would be racing
+        # it. Killing the write is the lesser harm; the next leader redoes it.
+        # Exiting non-zero also sends this pod back to being a standby in a
+        # fresh process rather than one that might still be half-reconciling.
+        log.error("%s; exiting now without waiting for in-flight reconciles", exc)
+        _hard_exit(1)
+
     # Ready means "reached the apiserver and campaigning", not "leading" --
     # see health.py for why a readiness gate only the leader can pass
     # deadlocks a rollout. It waits for the first Lease read, though, so a pod
@@ -210,12 +234,19 @@ def main() -> int:
             on_stopped_leading=_stop_leading,
             stop_event=stop_event,
             on_reachable=lambda: health.set_ready(True),
+            on_lost_leading=_lost_leading,
         )
-        return _shutdown_code(clean[0])
+        if not clean[0]:
+            # The drain gave up on a worker and the lease was kept, not
+            # released. It stops being renewed now, so the worker has to die
+            # before the lease can expire -- not whenever interpreter shutdown
+            # gets round to it.
+            health.stop()
+            _hard_exit(_shutdown_code(False))
+        return 0
     except LeadershipLost as exc:
-        # Exit non-zero so the Deployment restarts us: a replica that has lost
-        # the lease has to go back to being a standby, and the cheapest way to
-        # be sure it is not still half-reconciling is a fresh process.
+        # Only reached if _lost_leading returned, which it does not outside
+        # tests; kept so a lost lease can never look like a clean exit.
         log.error("%s", exc)
         return 1
     finally:

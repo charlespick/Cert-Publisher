@@ -306,6 +306,119 @@ def test_an_unreachable_apiserver_is_never_reported_reachable():
     assert calls == []
 
 
+# -- draining and losing -------------------------------------------------
+
+
+def _fast_elector(api, identity):
+    """Real clock, short timings: long enough to renew, short enough to test."""
+    return LeaderElector(
+        api, name="cert-publisher", namespace="cert-publisher",
+        identity=identity, lease_duration=0.6, renew_deadline=0.4,
+        retry_period=0.05,
+    )
+
+
+def test_the_lease_is_renewed_for_as_long_as_the_drain_takes():
+    """A drain can outlast a lease; letting it lapse meanwhile would hand a
+    standby the host this replica's worker is still writing to."""
+    api = _FakeLeases()
+    holder = _fast_elector(api, "pod-a")
+    stop = threading.Event()
+    renewals = []
+
+    def _slow_drain():
+        before = api.store[("cert-publisher", "cert-publisher")].spec.renew_time
+        # Three lease durations: without renewal a standby could take over.
+        threading.Event().wait(1.8)
+        after = api.store[("cert-publisher", "cert-publisher")].spec.renew_time
+        renewals.append(after > before)
+        return True
+
+    holder.run(
+        on_started_leading=stop.set,
+        on_stopped_leading=_slow_drain,
+        stop_event=stop,
+    )
+    assert renewals == [True], "the lease was not renewed during the drain"
+    assert _held_by(api) is None, "a drained shutdown should still release"
+
+
+def test_a_standby_cannot_take_over_mid_drain():
+    api = _FakeLeases()
+    holder = _fast_elector(api, "pod-a")
+    standby = _fast_elector(api, "pod-b")
+    stop = threading.Event()
+    stolen = []
+
+    def _drain_while_a_standby_campaigns():
+        for _ in range(30):  # 1.5s, well past a 0.6s lease
+            stolen.append(standby.try_acquire_or_renew())
+            threading.Event().wait(0.05)
+        return False  # ...and a worker is still going
+
+    holder.run(
+        on_started_leading=stop.set,
+        on_stopped_leading=_drain_while_a_standby_campaigns,
+        stop_event=stop,
+    )
+    assert not any(stolen), "a standby took the lease while a worker was draining"
+    assert _held_by(api) == "pod-a", "an undrained shutdown released the lease"
+
+
+class _Revocable(_FakeLeases):
+    """A lease API that starts refusing every call once ``cut`` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.cut = threading.Event()
+
+    def read_namespaced_lease(self, name, namespace, **kwargs):
+        if self.cut.is_set():
+            raise ApiException(status=503, reason="Service Unavailable")
+        return super().read_namespaced_lease(name, namespace, **kwargs)
+
+
+def test_losing_the_lease_does_not_wait_for_workers():
+    """Once a standby may take over, waiting on a worker only lengthens the
+    time it spends racing the new leader."""
+    api = _Revocable()
+    holder = _fast_elector(api, "pod-a")
+    lost, drained = [], []
+
+    with pytest.raises(leader_mod.LeadershipLost):
+        holder.run(
+            on_started_leading=api.cut.set,
+            on_stopped_leading=lambda: drained.append(True) or True,
+            stop_event=threading.Event(),
+            on_lost_leading=lost.append,
+        )
+    assert len(lost) == 1
+    assert drained == [], "drained workers after the lease was already lost"
+
+
+def test_losing_the_lease_mid_drain_is_reported_at_once():
+    """The drain may have most of its timeout left; the lease is already gone."""
+    api = _Revocable()
+    holder = _fast_elector(api, "pod-a")
+    stop = threading.Event()
+    lost_during_drain = []
+    lost = threading.Event()
+
+    def _drain():
+        api.cut.set()
+        lost_during_drain.append(lost.wait(3))
+        return False
+
+    with pytest.raises(leader_mod.LeadershipLost):
+        holder.run(
+            on_started_leading=stop.set,
+            on_stopped_leading=_drain,
+            stop_event=stop,
+            on_lost_leading=lambda exc: lost.set(),
+        )
+    assert lost_during_drain == [True], "loss was only noticed after the drain"
+
+
 # -- bounded calls --------------------------------------------------------
 
 
