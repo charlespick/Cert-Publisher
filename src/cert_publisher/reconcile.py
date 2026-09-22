@@ -260,9 +260,10 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
             f"for {remaining}. If a certificate was imported, check that the "
             f"iDRAC restarted to apply it and that it carries the expected "
             f"subject alternative names. If no certificate was issued, check "
-            f"the issuer and any approver policy for this namespace. Editing "
-            f"the publication's spec retries immediately; so does clearing "
-            f".status.lastSigningTime.",
+            f"the issuer and any approver policy for this namespace. If the "
+            f"round never got as far as a request, the Events on this "
+            f"publication say what stopped it. Editing the publication's spec "
+            f"retries immediately; so does clearing .status.lastSigningTime.",
             reason=REASON_SIGNING_COOLDOWN,
             next_retry=rfc3339(now_utc() + retry_in),
         )
@@ -488,17 +489,34 @@ def _resolve_pending_request(
     if problem is not None:
         log.error("[%s] refusing to import the signed certificate: %s", ref, problem)
         kube.delete_certificate_request(namespace, pending)
-        set_status(
-            kube, pub, ERROR,
+        # A fresh round is gated by the signing cooldown, so come back when the
+        # cooldown actually ends rather than on the resync -- which lands
+        # inside it, finds the host still needing renewal, and replaces this
+        # diagnosis with the cooldown's generic one (plus an Event for a
+        # transition that is not one). Same reasoning as _restart_signing.
+        remaining = _signing_cooldown_remaining(pub.get("status") or {})
+        message = (
             f"The signed certificate was not installed because {problem}. This "
             f"usually means the host's CSR did not carry the requested subject "
-            f"alternative names.",
+            f"alternative names."
+        )
+        if remaining is None:
+            delay = _RESTART_SIGNING_REQUEUE
+        else:
+            delay = remaining + datetime.timedelta(seconds=5)
+            message = (
+                f"{message} A new signing round opens when the signing cooldown "
+                f"ends in {_round_duration(remaining)}. Editing the "
+                f"publication's spec retries immediately; so does clearing "
+                f".status.lastSigningTime."
+            )
+        set_status(
+            kube, pub, ERROR, message,
             reason=REASON_UNUSABLE_CERTIFICATE,
             pending_request=None,
+            next_retry=rfc3339(now_utc() + delay),
         )
-        # A fresh round is gated by the signing cooldown anyway, so there is
-        # nothing to gain from asking for one sooner than the resync.
-        return Result()
+        return Result(requeue_after=delay)
 
     fingerprint = sha256_fingerprint(cert_pem)
 
@@ -555,6 +573,23 @@ def _start_signing(
     spec = pub["spec"]
     namespace = meta["namespace"]
 
+    # Stamp the cooldown *before* asking the host for a CSR, and insist the
+    # write lands. That stamp is the only thing throttling a round that does
+    # not converge, and generating a CSR rotates the iDRAC's key -- which
+    # resets the BMC -- so it has to be recorded before anything irreversible
+    # happens, not after. Written afterwards, a status write that failed would
+    # leave a rotated key with nothing to throttle the retry, and the backoff
+    # would rotate again at 5s, 10s, 20s. Failing here instead costs nothing:
+    # the host has not been touched yet. Never rotate a host's key without
+    # having recorded that we were about to.
+    set_status(
+        kube, pub, PENDING,
+        f"Opening a signing round ({reason})",
+        reason=REASON_SIGNING_PENDING,
+        mark_signing=True, strict=True,
+        ready=still_serving,
+    )
+
     dns_names = spec["dnsNames"]
     common_name = spec.get("commonName") or dns_names[0]
     csr_pem = prov.generate_csr(common_name=common_name, dns_names=dns_names)
@@ -562,19 +597,17 @@ def _start_signing(
     digest = hashlib.sha256(csr_pem).hexdigest()[:10]
     request_name = f"{meta['name']}-{digest}"
 
-    # Record the name *before* creating the request, and insist the write
-    # lands. Generating a CSR has already rotated the host's key, so the
-    # ordering decides what a failure costs: recorded-then-missing is
-    # self-healing (the next run finds a dangling name and clears it), whereas
-    # created-then-unrecorded strands a request nothing will ever look up
-    # again, because the next CSR yields a different name. That only holds if
-    # the write actually succeeded, hence strict -- a status write we cannot
-    # confirm means we do not create the request at all.
+    # Record the name *before* creating the request, and insist this write
+    # lands too. The ordering decides what a failure costs: recorded-then-
+    # missing is self-healing (the next run finds a dangling name and clears
+    # it), whereas created-then-unrecorded strands a request nothing will ever
+    # look up again, because the next CSR yields a different name. The phase
+    # and reason match the write above, so this adds no second Event.
     set_status(
         kube, pub, PENDING,
         f"Signing request submitted ({reason}); awaiting issuance",
         reason=REASON_SIGNING_PENDING,
-        pending_request=request_name, mark_signing=True, strict=True,
+        pending_request=request_name, strict=True,
         ready=still_serving,
     )
     log.info("[%s] creating CertificateRequest %s", ref, request_name)

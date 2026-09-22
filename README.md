@@ -336,10 +336,7 @@ The CRD carries a `helm.sh/resource-policy: keep` annotation, so uninstalling
 the release leaves the CRD and any `CertPublication`s in place.
 
 There is no replica count to set: the controller always runs as exactly one
-pod (see [One pod, never two](#one-pod-never-two)). `replicaCount`,
-`leaderElection.*` and `podDisruptionBudget.*` from earlier builds of the chart
-no longer exist, and Helm ignores them without complaint if they are still
-set.
+pod (see [One pod, never two](#one-pod-never-two)).
 
 ### Upgrading from the CronJob
 
