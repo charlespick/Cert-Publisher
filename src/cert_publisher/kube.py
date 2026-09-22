@@ -39,18 +39,9 @@ class Kube:
             kube_config.load_kube_config()
         self.custom = client.CustomObjectsApi()
         self.core = client.CoreV1Api()
-        self.coordination = client.CoordinationV1Api()
-        # Names this process in the Events it emits, so a two-replica install
-        # shows which one acted.
+        # Names this process in the Events it emits.
         self.reporter = reporter
         self.instance = os.environ.get("POD_NAME") or reporter
-
-    def list_publications(self, namespace: str | None = None) -> list[dict]:
-        if namespace:
-            resp = self.custom.list_namespaced_custom_object(GROUP, VERSION, namespace, PLURAL)
-        else:
-            resp = self.custom.list_cluster_custom_object(GROUP, VERSION, PLURAL)
-        return resp.get("items", [])
 
     def get_publication(self, namespace: str, name: str) -> dict | None:
         """Read one publication, or None if it has been deleted.
@@ -164,9 +155,9 @@ class Kube:
             "apiVersion": "v1",
             "kind": "Event",
             "metadata": {
-                # generateName rather than a name we compose: two replicas
-                # mid-handover, or two transitions in the same second, must not
-                # collide on it.
+                # generateName rather than a name we compose: two transitions
+                # in the same second, or an old pod and its replacement, must
+                # not collide on it.
                 "generateName": f"{meta['name']}.",
                 "namespace": namespace,
             },

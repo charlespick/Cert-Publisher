@@ -13,7 +13,7 @@ WinRM, and reloading whatever needs to pick it up.
 
 A `CertPublication` custom resource declares the certificate you want (DNS
 names, issuer) and where it should be installed (the provisioner). The
-controller runs as a Kubernetes `Deployment` and **watches**: it reacts to a new
+controller runs as a single-replica Kubernetes `StatefulSet` and **watches**: it reacts to a new
 or edited `CertPublication`, and to cert-manager issuing a certificate, within
 seconds. For each publication it:
 
@@ -105,28 +105,30 @@ win01   win01.example.com    winrm         False   Error       9m
 kubectl wait --for=condition=Ready certpublication/web01 --timeout=5m
 ```
 
-### One replica reconciles
+### One pod, never two
 
 Publishing a certificate writes to a host: it installs files, imports a PFX,
-reboots an iDRAC. Two replicas doing that at once would install twice and, on
-the iDRAC path, rotate the host's key out from under each other's pending
-`CertificateRequest`. So the controller uses `coordination.k8s.io` `Lease`
-leader election — every replica runs and campaigns, only the leaseholder
-reconciles, and a clean shutdown releases the lease so a standby takes over in
-about a second rather than waiting out a full lease duration. If a publish is
-still running when `controller.shutdownTimeout` expires, the lease is *not*
-released: it is left to expire instead, because handing it over while this pod
-is still writing to a host is what leader election is there to prevent.
-Raising `replicaCount` buys faster failover, not more throughput.
+reboots an iDRAC. Two pods doing that at once would install twice and, on the
+iDRAC path, rotate the host's key out from under each other's pending
+`CertificateRequest`. So the chart runs the controller as a single-replica
+`StatefulSet`, which — unlike a `Deployment` — does not start a replacement pod
+until the old one is gone. On a rollout the old pod drains first: it stops
+taking new work and gives any publish in flight up to
+`controller.shutdownTimeout` to finish, and only then does its replacement
+start. The trade-off is that if the pod's node stops responding, nothing
+replaces it until the node recovers or the pod is force-deleted; certificate
+publishing can wait for that far more easily than it can survive two
+controllers writing to the same host.
 
 `/healthz` fails on the two things that stop the controller without stopping
 the process: a watch gone silent — neither delivering events nor erroring —
 and a reconcile still running after `controller.reconcileTimeout`, which means
 a provisioner call has hung and is holding a worker that every publication
-behind it is waiting on. Either restarts the pod. `/readyz` answers "wired up
-and campaigning", deliberately *not* "leading": a readiness gate only the
-leader can pass would deadlock a rolling update. `/leader` answers the honest
-question, and is kept out of the probes for that reason.
+behind it is waiting on. Either restarts the pod. A watch that is *failing*
+(missing RBAC, a missing cert-manager CRD) does not fail liveness, because a
+restart would not fix it; it logs each failure and keeps retrying. `/readyz`
+passes once every watch has listed successfully, which proves the pod can
+reach the apiserver with the access it needs.
 
 ## Provisioners
 

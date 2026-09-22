@@ -86,7 +86,7 @@ CERTIFICATE_REQUESTS = WatchedResource(CM_GROUP, CM_VERSION, CM_CR_PLURAL)
 
 @dataclass(frozen=True)
 class ControllerConfig:
-    """Tunables, all surfaced as Helm values on the Deployment."""
+    """Tunables, all surfaced as Helm values on the StatefulSet."""
 
     namespace: str | None = None
     workers: int = 4
@@ -131,15 +131,20 @@ class _Watcher:
         self._config = config
         self._on_key = on_key
         self._on_sync_key = on_sync_key or on_key
-        # The last generation seen per publication. Every reconcile writes
-        # .status, and a status write is a MODIFIED event like any other; left
-        # unfiltered, each reconcile would queue the next one, and neither the
-        # resync interval nor the retry backoff would ever get a say.
-        self._generations: dict[str, int] = {}
+        # What was last seen of each publication: its generation, and whether
+        # it carried a lastSigningTime. Every reconcile writes .status, and a
+        # status write is a MODIFIED event like any other; left unfiltered,
+        # each reconcile would queue the next one, and neither the resync
+        # interval nor the retry backoff would ever get a say.
+        self._seen: dict[str, tuple[int | None, bool]] = {}
         self._watch: watch.Watch | None = None
         self._lock = threading.Lock()
-        # Liveness: when this loop last knew it was connected and current.
+        # Liveness: when this loop last showed it was not stuck -- a call that
+        # returned, whether with events, a timeout, or an error.
         self._last_healthy = time.monotonic()
+        # Readiness: whether a list has ever succeeded, which is proof this
+        # pod can reach the apiserver with the RBAC it needs.
+        self.synced = False
         self.thread: threading.Thread | None = None
         # One loop, so one key -- but the jitter and the ceiling are the same
         # problem the queue's retries have, and the same implementation.
@@ -150,9 +155,7 @@ class _Watcher:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self, stop_event: threading.Event) -> None:
-        # The silence clock starts now, not at construction: a standby builds
-        # its watchers at boot and may campaign for hours before it starts
-        # them, and must not win the lease already looking hours overdue.
+        # The silence clock starts now, not at construction.
         self._last_healthy = time.monotonic()
         self.thread = threading.Thread(
             target=self._run, args=(stop_event,),
@@ -216,7 +219,15 @@ class _Watcher:
             # Only reached after a failure: wait before reconnecting so a
             # rejected watch (RBAC, a missing CRD) does not hammer the
             # apiserver.
-            if stop_event.wait(self._backoff.next_backoff(self._resource.label)):
+            #
+            # A failure is not silence: the call came back, so the loop is not
+            # stuck, and a restart would not fix what it is failing on -- it
+            # would only interrupt every publication that is working. The error
+            # is logged each time; liveness is for a loop that has hung. So the
+            # loop counts as alive through the wait it is choosing to make.
+            delay = self._backoff.next_backoff(self._resource.label)
+            self._last_healthy = time.monotonic() + delay
+            if stop_event.wait(delay):
                 break
         log.debug("[%s] watcher stopped", self._resource.label)
 
@@ -224,8 +235,8 @@ class _Watcher:
         """List the resource and return the version to start watching from.
 
         For publications this is also the seeding pass: every existing one is
-        queued, which is what makes a fresh pod (or one that has just won the
-        lease) converge on the whole cluster rather than only on what changes
+        queued, which is what makes a fresh pod converge on the whole cluster
+        rather than only on what changes
         from now on. It runs again after a relist, because a watch that lost
         its position may have lost changes with it. For the resources we
         merely own, only the version is wanted -- the publications they belong
@@ -234,17 +245,18 @@ class _Watcher:
         """
         if self._resource.is_publication:
             items, version = self._list(limit=None)
-            self._generations.clear()
+            self._seen.clear()
             for item in items:
                 key = _publication_key(item)
                 if key:
-                    self._remember_generation(key, item)
+                    self._seen[key] = _seen_state(item)
                     self._on_sync_key(key)
             log.info("[%s] synced %d object(s)", self._resource.label, len(items))
         else:
             _, version = self._list(limit=1)
             log.info("[%s] watching from version %s", self._resource.label, version)
         self._last_healthy = time.monotonic()
+        self.synced = True
         return version
 
     def _list(self, *, limit: int | None) -> tuple[list[dict], str]:
@@ -316,19 +328,23 @@ class _Watcher:
         ``metadata.generation`` only moves when the spec does -- the status
         subresource exists precisely so that writing it does not -- so an
         unchanged generation means nothing the reconcile reads has changed.
+
+        With one exception, which a person makes on purpose: clearing
+        ``.status.lastSigningTime`` is the documented way to skip the signing
+        cooldown, and it is a status write. This process sets that field but
+        never clears it, so its disappearance is always someone asking for a
+        retry, and is let through.
         """
         if event_type == "DELETED":
-            self._generations.pop(key, None)
+            self._seen.pop(key, None)
             return True
-        previous = self._generations.get(key)
-        current = self._remember_generation(key, obj)
-        return current is None or current != previous
-
-    def _remember_generation(self, key: str, obj: dict) -> int | None:
-        generation = (obj.get("metadata") or {}).get("generation")
-        if generation is not None:
-            self._generations[key] = generation
-        return generation
+        previous = self._seen.get(key)
+        current = self._seen[key] = _seen_state(obj)
+        if previous is None or current[0] is None:
+            return True
+        if current[0] != previous[0]:
+            return True
+        return previous[1] and not current[1]
 
     # -- namespaced vs cluster-wide ---------------------------------------
 
@@ -350,6 +366,13 @@ class _Watcher:
         return (namespaced if self._config.namespace else cluster_wide)(
             *self._watch_args(), **kwargs
         )
+
+
+def _seen_state(obj: dict) -> tuple[int | None, bool]:
+    """The parts of a publication event that decide whether to reconcile."""
+    generation = (obj.get("metadata") or {}).get("generation")
+    signing = bool((obj.get("status") or {}).get("lastSigningTime"))
+    return generation, signing
 
 
 def _publication_key(obj: dict) -> str | None:
@@ -436,15 +459,14 @@ class Controller:
     def stop(self) -> bool:
         """Stop accepting work and let in-flight reconciles finish.
 
-        Called on SIGTERM and on losing the lease. A reconcile mid-flight is
+        Called on SIGTERM. A reconcile mid-flight is
         talking to a host over SSH or WS-Man and cannot be interrupted safely,
         so it is given until ``shutdown_timeout_seconds`` -- which is why the
-        Deployment's termination grace period is set above that.
+        pod's termination grace period is set above that.
 
         Returns whether every worker finished. A Python thread cannot be
-        forced to stop, so a False here means one is still writing to a host:
-        the caller must not release the lease, and must end the process before
-        the lease can expire, so the worker dies before a successor starts.
+        forced to stop, so a False here means one is still writing to a host,
+        and is cut off when the process exits.
         """
         if not self._started:
             return True
@@ -464,7 +486,7 @@ class Controller:
                     if worker in still_running
                 )
             # Error, not warning: when the process exits these writes are cut
-            # off wherever they are. The next leader reconciles them again,
+            # off wherever they are. The next pod reconciles them again,
             # but a host caught mid-import is worth a human looking at.
             log.error(
                 "shutdown timed out after %.0fs with %d reconcile(s) still "
@@ -475,6 +497,16 @@ class Controller:
         self._threads.clear()
         self._started = False
         return not still_running
+
+    def ready(self) -> bool:
+        """Whether every watch has listed successfully at least once.
+
+        That is the proof this pod can reach the apiserver with the RBAC it
+        needs for all three resources -- a missing cert-manager CRD or a
+        missing grant keeps it unready, rather than running and quietly
+        never hearing about issuances.
+        """
+        return self._started and all(w.synced for w in self._watchers)
 
     def healthy(self) -> bool:
         """Whether this process is still doing its job, for the liveness probe.
@@ -590,8 +622,8 @@ class Controller:
     def _enqueue_startup(self, key: str) -> None:
         """Queue ``key`` soon, but spread across the startup window.
 
-        A pod that has just won the lease has to look at every publication --
-        it has no idea what happened while nobody was leading -- but it must
+        A pod that has just started has to look at every publication -- it has
+        no idea what happened while nothing was running -- but it must
         not reach for every host in the fleet in the same second to do it.
         """
         self._queue.add_after(

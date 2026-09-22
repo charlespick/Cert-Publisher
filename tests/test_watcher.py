@@ -1,6 +1,7 @@
 """The watch loop: what turns "a certificate was issued" into a reconcile."""
 
 import threading
+import time
 
 from kubernetes.client.rest import ApiException
 
@@ -117,6 +118,36 @@ def test_a_spec_change_to_a_publication_is_queued():
     assert keys == ["default/web01"]
 
 
+def _signed(name, generation, stamp):
+    pub = _versioned(name, generation)
+    if stamp:
+        pub["status"] = {"lastSigningTime": stamp}
+    return pub
+
+
+def test_clearing_last_signing_time_is_queued_although_it_is_a_status_write():
+    """It is the documented way to skip the signing cooldown; dropping it as
+    "status only" would leave the publication waiting out the full hour."""
+    keys = []
+    watcher = _watcher(PUBLICATIONS, _FakeCustom([_signed("idrac01", 1, "t0")]), keys, [])
+    watcher._sync()
+
+    watcher._handle({"type": "MODIFIED", "object": _signed("idrac01", 1, None)})
+    assert keys == ["default/idrac01"]
+
+
+def test_our_own_signing_stamp_is_still_filtered():
+    """Only the operator sets lastSigningTime, as part of a reconcile that is
+    already running; that write must not queue another."""
+    keys = []
+    watcher = _watcher(PUBLICATIONS, _FakeCustom([_signed("idrac01", 1, None)]), keys, [])
+    watcher._sync()
+
+    watcher._handle({"type": "MODIFIED", "object": _signed("idrac01", 1, "t1")})
+    watcher._handle({"type": "MODIFIED", "object": _signed("idrac01", 1, "t1")})
+    assert keys == []
+
+
 def test_a_new_publication_and_a_deleted_one_are_both_queued():
     keys = []
     watcher = _watcher(PUBLICATIONS, _FakeCustom(), keys, [])
@@ -206,6 +237,28 @@ def test_a_transient_failure_resumes_rather_than_relisting():
     assert not thread.is_alive()
     assert seen == ["55", "55"], "did not resume from the last known position"
     assert len(custom.list_calls) == 1, "relisted after a transient failure"
+
+
+def test_a_watch_that_keeps_failing_is_not_reported_as_hung():
+    """A restart does not fix missing RBAC or a missing CRD; it only interrupts
+    every publication that is working. Liveness is for a loop that hangs."""
+    custom = _FakeCustom()
+    watcher = _watcher(PUBLICATIONS, custom, [], [], backoff_base_seconds=30.0)
+    watcher._last_healthy -= 10_000
+    stop = threading.Event()
+
+    def _fake_watch_from(resource_version, stop_event):
+        raise ApiException(status=403, reason="Forbidden")
+
+    watcher._watch_from = _fake_watch_from
+    thread = threading.Thread(target=watcher._run, args=(stop,), daemon=True)
+    thread.start()
+    thread.join(timeout=0.5)
+
+    # Counted alive through the backoff it chose to wait out.
+    assert watcher.last_healthy > time.monotonic() + 20
+    stop.set()
+    thread.join(timeout=5)
 
 
 def test_a_broken_watch_backs_off_before_reconnecting():

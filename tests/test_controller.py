@@ -318,9 +318,8 @@ def test_healthy_until_a_watch_goes_silent():
     assert not ctrl.healthy()
 
 
-def test_a_standby_that_wins_the_lease_late_is_not_already_overdue(monkeypatch):
-    """Watchers are built at boot; a standby may campaign for hours before it
-    starts them, and must not fail liveness the moment it does."""
+def test_the_silence_clock_starts_when_the_watchers_do(monkeypatch):
+    """Time between building the watchers and starting them is not silence."""
     ctrl = _controller(_FakeKube({}))
     for watcher in ctrl._watchers:
         watcher._last_healthy -= 10_000  # built long ago
@@ -331,6 +330,20 @@ def test_a_standby_that_wins_the_lease_late_is_not_already_overdue(monkeypatch):
         assert ctrl.healthy()
     finally:
         ctrl.stop()
+
+
+def test_ready_only_once_every_watch_has_listed():
+    """A missing cert-manager CRD or RBAC grant leaves the pod unready rather
+    than running and never hearing about issuances."""
+    ctrl = _controller(_FakeKube({}))
+    assert not ctrl.ready(), "ready before it had even started"
+    ctrl._started = True
+    publications, *owned = ctrl._watchers
+    publications.synced = True
+    assert not ctrl.ready(), "ready with the cert-manager watches never listed"
+    for watcher in owned:
+        watcher.synced = True
+    assert ctrl.ready()
 
 
 def test_a_wedged_reconcile_fails_liveness():
@@ -348,7 +361,7 @@ def test_a_wedged_reconcile_fails_liveness():
 
 
 def test_stop_reports_a_worker_that_did_not_finish():
-    """Leadership must not be handed on while this is False."""
+    """A False here is a write about to be cut off, and main exits non-zero."""
     kube = _FakeKube({})
     ctrl = _controller(kube, shutdown_timeout_seconds=0.1)
     assert ctrl.stop() is True, "never started, so nothing to drain"

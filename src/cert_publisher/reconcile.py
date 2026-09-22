@@ -238,7 +238,7 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
     #    achieve it. Signing again would rotate the key and reset the BMC on
     #    every run, so stop and say so instead.
     #
-    #    Unless the publication itself changed since we last looked: editing it
+    #    Unless the publication's spec changed since we last looked: editing it
     #    is an operator saying "I've addressed that", and making them wait out
     #    a rate limit aimed at runaway retries would be the wrong answer to a
     #    deliberate act.
@@ -261,7 +261,7 @@ def _reconcile_host_keyed(kube: Kube, pub: dict, ref: str) -> Result:
             f"iDRAC restarted to apply it and that it carries the expected "
             f"subject alternative names. If no certificate was issued, check "
             f"the issuer and any approver policy for this namespace. Editing "
-            f"the publication retries immediately; so does clearing "
+            f"the publication's spec retries immediately; so does clearing "
             f".status.lastSigningTime.",
             reason=REASON_SIGNING_COOLDOWN,
             next_retry=rfc3339(now_utc() + retry_in),
@@ -396,8 +396,8 @@ def _restart_signing(kube: Kube, pub: dict, message: str, *, reason: str) -> Res
         delay = remaining + datetime.timedelta(seconds=5)
         message = (
             f"{message}; a new one will be created when the signing cooldown "
-            f"ends in {_round_duration(remaining)}. Editing the publication "
-            f"retries immediately; so does clearing .status.lastSigningTime."
+            f"ends in {_round_duration(remaining)}. Editing the publication's "
+            f"spec retries immediately; so does clearing .status.lastSigningTime."
         )
     set_status(
         kube, pub, PENDING, message,

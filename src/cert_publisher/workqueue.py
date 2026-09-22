@@ -82,18 +82,24 @@ class WorkQueue:
         """Take the next key, or ``None`` if none came up within ``timeout``.
 
         The caller owns the key until it calls :meth:`done` with it.
+
+        Nothing is handed out once the queue is shut down, even if keys are
+        still waiting. (client-go's queue drains them instead.) Here every key
+        is a conversation with a host -- on the iDRAC path, one that rotates
+        its key -- and a shutdown should wait for the ones in flight, not start
+        new ones. Whatever is left is picked up again by the next pod's list.
         """
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._shutdown:
+                    return None
                 self._promote_due_locked(time.monotonic())
                 if self._queue:
                     key = self._queue.popleft()
                     self._dirty.discard(key)
                     self._processing.add(key)
                     return key
-                if self._shutdown:
-                    return None
                 now = time.monotonic()
                 wait = deadline - now
                 if wait <= 0:

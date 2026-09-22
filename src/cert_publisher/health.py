@@ -1,6 +1,6 @@
-"""Liveness and readiness endpoints for the operator Deployment.
+"""Liveness and readiness endpoints for the operator pod.
 
-A CronJob's health was its exit code. A Deployment has no exit code to report,
+A CronJob's health was its exit code. A long-running pod has no exit code to report,
 so the same information has to be reachable over HTTP:
 
 ``/healthz``
@@ -10,17 +10,9 @@ so the same information has to be reachable over HTTP:
     relists.
 
 ``/readyz``
-    Has this process reached the apiserver -- read the Lease at least once --
-    and is it campaigning? Deliberately *not*
-    "is it the leader": a rolling update replaces pods one at a time and waits
-    for each to become ready, so a readiness gate that only the leader can pass
-    deadlocks the moment there is more than one replica -- the new pod waits
-    for the lease the old pod is holding, and the old pod waits to be replaced.
-
-``/leader``
-    Is this replica the one reconciling? The honest answer to that question,
-    kept out of the probes for the reason above, and worth scraping or curling
-    when you want to know which pod to read the logs of.
+    Has this process reached the apiserver with working credentials and RBAC?
+    It turns ready once the first list of CertPublications succeeds, so a pod
+    that cannot do its job does not report that it can.
 """
 
 from __future__ import annotations
@@ -40,8 +32,7 @@ class HealthServer:
         self._port = port
         self._address = address
         self._live_checks: list[Callable[[], bool]] = []
-        self._ready = threading.Event()
-        self._leading = threading.Event()
+        self._ready_checks: list[Callable[[], bool]] = []
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -50,27 +41,26 @@ class HealthServer:
     def add_liveness_check(self, check: Callable[[], bool]) -> None:
         self._live_checks.append(check)
 
-    def set_ready(self, ready: bool) -> None:
-        if ready:
-            self._ready.set()
-        else:
-            self._ready.clear()
+    def add_readiness_check(self, check: Callable[[], bool]) -> None:
+        self._ready_checks.append(check)
 
-    def set_leading(self, leading: bool) -> None:
-        if leading:
-            self._leading.set()
-        else:
-            self._leading.clear()
-
-    def _alive(self) -> bool:
-        for check in self._live_checks:
+    @staticmethod
+    def _passes(checks: list[Callable[[], bool]], what: str) -> bool:
+        for check in checks:
             try:
                 if not check():
                     return False
             except Exception:
-                log.exception("liveness check raised; reporting unhealthy")
+                log.exception("%s check raised; reporting failure", what)
                 return False
         return True
+
+    def _alive(self) -> bool:
+        return self._passes(self._live_checks, "liveness")
+
+    def _ready(self) -> bool:
+        # Not ready until something has said what ready means.
+        return bool(self._ready_checks) and self._passes(self._ready_checks, "readiness")
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -86,11 +76,8 @@ class HealthServer:
                     ok = outer._alive()
                     body = b"ok\n" if ok else b"unhealthy\n"
                 elif path == "/readyz":
-                    ok = outer._ready.is_set()
+                    ok = outer._ready()
                     body = b"ok\n" if ok else b"starting\n"
-                elif path == "/leader":
-                    ok = outer._leading.is_set()
-                    body = b"leading\n" if ok else b"standby\n"
                 else:
                     ok, body = False, b"not found\n"
                     self._respond(404, body)

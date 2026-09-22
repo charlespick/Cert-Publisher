@@ -61,36 +61,4 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "cert-publisher.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
-{{- if .Values.leaderElection.enabled }}
----
-# The leader-election Lease lives beside the controller, so this is a namespaced
-# Role rather than another cluster-wide grant.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ include "cert-publisher.fullname" . }}-leader-election
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "cert-publisher.labels" . | nindent 4 }}
-rules:
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "create", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "cert-publisher.fullname" . }}-leader-election
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "cert-publisher.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {{ include "cert-publisher.fullname" . }}-leader-election
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "cert-publisher.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
-{{- end }}
 {{- end }}

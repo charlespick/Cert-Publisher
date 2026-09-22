@@ -1,4 +1,12 @@
-{{- $replicas := int .Values.replicaCount -}}
+{{- $replicas := 1 -}}
+{{- /*
+  Exactly one replica, by design. Publishing a certificate writes to a host,
+  and two pods doing it at once would install twice and, on the iDRAC path,
+  rotate the host's key out from under each other's pending request. A
+  single-replica StatefulSet guarantees at most one pod: unlike a Deployment,
+  it does not start a replacement until the old pod is confirmed gone -- on
+  a rollout, a drain, or a node that stops responding.
+*/ -}}
 {{- /*
   Backwards compatibility with the CronJob this chart used to install:
   `cronjob.suspend=true` was how a release was paused without uninstalling it,
@@ -11,7 +19,7 @@
 {{- end -}}
 {{- end -}}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "cert-publisher.fullname" . }}
   namespace: {{ .Release.Namespace }}
@@ -19,15 +27,11 @@ metadata:
     {{- include "cert-publisher.labels" . | nindent 4 }}
 spec:
   replicas: {{ $replicas }}
-  strategy:
-    # maxSurge 0 so a replacement pod is never running while the pod it
-    # replaces still holds the lease: the outgoing pod releases it on SIGTERM,
-    # and its replacement then takes over in about a second rather than waiting
-    # out a full lease duration.
+  # Required by older API servers. Nothing addresses this pod by DNS, so no
+  # Service is created for it.
+  serviceName: {{ include "cert-publisher.fullname" . }}
+  updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 0
   selector:
     matchLabels:
       {{- include "cert-publisher.selectorLabels" . | nindent 6 }}
@@ -71,16 +75,11 @@ spec:
             # Leave WATCH_NAMESPACE empty to reconcile the whole cluster.
             - name: WATCH_NAMESPACE
               value: {{ .Values.config.watchNamespace | quote }}
-            # Identifies this replica in the lease it holds and in the Events
-            # it records, so a two-replica install shows which one acted.
+            # Identifies this pod in the Events it records.
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             - name: HEALTH_PORT
               value: {{ .Values.healthProbe.port | quote }}
             - name: WORKER_COUNT
@@ -101,23 +100,13 @@ spec:
               value: {{ .Values.controller.shutdownTimeout | quote }}
             - name: RECONCILE_TIMEOUT
               value: {{ .Values.controller.reconcileTimeout | quote }}
-            - name: LEADER_ELECTION
-              value: {{ .Values.leaderElection.enabled | quote }}
-            - name: LEADER_ELECTION_ID
-              value: {{ .Values.leaderElection.name | default (include "cert-publisher.fullname" .) | quote }}
-            - name: LEADER_LEASE_DURATION
-              value: {{ .Values.leaderElection.leaseDuration | quote }}
-            - name: LEADER_RENEW_DEADLINE
-              value: {{ .Values.leaderElection.renewDeadline | quote }}
-            - name: LEADER_RETRY_PERIOD
-              value: {{ .Values.leaderElection.retryPeriod | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           # Liveness fails when a watch has gone silent -- neither delivering
-          # events nor erroring -- which no amount of waiting fixes. Readiness
-          # is deliberately not gated on holding the lease: a standby is a
-          # working pod, and gating it there would deadlock a rollout.
+          # events nor erroring -- or a reconcile has hung, neither of which
+          # waiting fixes. Readiness passes once every watch has listed, which
+          # proves the pod can reach the apiserver with the RBAC it needs.
           livenessProbe:
             httpGet:
               path: /healthz

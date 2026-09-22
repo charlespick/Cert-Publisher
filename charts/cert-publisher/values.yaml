@@ -10,11 +10,6 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# One replica reconciles; any others stand by, campaigning for the lease and
-# ready to take over. Raising this buys faster failover, not more throughput --
-# publishing a certificate writes to a host, so exactly one replica may do it.
-replicaCount: 1
-
 crds:
   # Install the CertPublication CRD as part of the release. Set to false if you
   # manage the CRD separately (e.g. a shared cluster where another release owns
@@ -24,7 +19,7 @@ crds:
 rbac:
   # Create the ClusterRole and ClusterRoleBinding the controller needs to watch
   # CertPublications and read Secrets cluster-wide and manage cert-manager
-  # Certificates, plus the namespaced Role for its leader-election Lease.
+  # Certificates.
   create: true
 
 serviceAccount:
@@ -79,44 +74,24 @@ controller:
   # publish -- an iDRAC import and reset takes minutes.
   reconcileTimeout: 900
 
-leaderElection:
-  # Only the replica holding the Lease reconciles. Disabling this is only safe
-  # with exactly one replica: two publishing to the same host would install
-  # twice and, on the iDRAC path, rotate the host's key out from under each
-  # other's pending CertificateRequest.
-  enabled: true
-  # Lease name. Defaults to the release fullname when empty.
-  name: ""
-  # Seconds a candidate must watch the Lease go unrenewed before taking it.
-  leaseDuration: 15
-  # Seconds the holder has to renew before it gives up leading. Must be less
-  # than leaseDuration, so a leader stands down before its successor may start.
-  renewDeadline: 10
-  # Seconds between acquire/renew attempts. Must be less than renewDeadline.
-  retryPeriod: 2
-
 healthProbe:
   port: 8080
-  # /healthz fails when a watch has gone silent, which restarts the pod so it
-  # relists.
+  # /healthz fails when a watch has gone silent or a reconcile has hung, which
+  # restarts the pod. A watch that is failing -- RBAC, a missing CRD -- is not
+  # silent: it logs each failure and keeps retrying, since a restart would not
+  # fix it.
   liveness:
     initialDelaySeconds: 15
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
-  # /readyz answers "wired up and campaigning", not "leading" -- see the chart
-  # README. A standby is a working pod.
+  # /readyz passes once every watch has listed successfully: proof the pod can
+  # reach the apiserver with the RBAC it needs.
   readiness:
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
-
-podDisruptionBudget:
-  # Only meaningful with replicaCount > 1; a single-replica controller has no
-  # availability to budget for, and a PDB over it would block node drains.
-  enabled: false
-  minAvailable: 1
 
 # Extra environment variables for the container.
 extraEnv: []
@@ -153,7 +128,7 @@ priorityClassName: ""
 
 # Deprecated. The controller was a CronJob before it was an operator, and it no
 # longer polls on a schedule -- it watches. Only `cronjob.suspend` still does
-# anything: it scales the Deployment to zero, as it used to suspend the
+# anything: it scales the StatefulSet to zero, as it used to suspend the
 # CronJob. Everything else here is ignored, and the whole block will be removed
 # in a future release.
 cronjob:

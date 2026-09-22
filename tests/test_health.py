@@ -1,4 +1,4 @@
-"""Probes are how a Deployment says what an exit code used to."""
+"""Probes are how a long-running pod says what an exit code used to."""
 
 import socket
 import urllib.error
@@ -41,14 +41,21 @@ def test_a_fresh_process_is_alive_but_not_yet_ready(server):
     assert _get(server, "/readyz") == 503
 
 
-def test_readiness_is_not_gated_on_leadership(server):
-    """A readiness gate only the leader can pass deadlocks a rolling update."""
-    server.set_ready(True)
+def test_readiness_follows_its_checks(server):
+    ready = [False]
+    server.add_readiness_check(lambda: ready[0])
+    assert _get(server, "/readyz") == 503
+    ready[0] = True
     assert _get(server, "/readyz") == 200
-    assert _get(server, "/leader") == 503, "a standby claimed to be the leader"
 
-    server.set_leading(True)
-    assert _get(server, "/leader") == 200
+
+def test_a_readiness_check_that_raises_is_not_ready(server):
+    server.add_readiness_check(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _get(server, "/readyz") == 503
+
+
+def test_there_is_no_leader_endpoint_any_more(server):
+    assert _get(server, "/leader") == 404
 
 
 def test_a_failing_check_fails_liveness(server):

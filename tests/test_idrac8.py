@@ -1304,7 +1304,7 @@ def test_the_cooldown_still_holds_when_the_spec_is_unchanged(monkeypatch):
 
     assert prov.csr_args is None
     assert kube.status["phase"] == ERROR
-    assert "Editing the publication retries immediately" in kube.status["message"]
+    assert "Editing the publication's spec retries immediately" in kube.status["message"]
 
 
 def test_extended_key_usages_are_derived_when_the_csr_carries_them():

@@ -79,6 +79,17 @@ def test_shutdown_releases_waiting_consumers():
     assert queue.get(timeout=0.05) is None
 
 
+def test_no_new_work_is_handed_out_after_shutdown():
+    """A shutdown waits for the publishes in flight; it must not start more.
+    On the iDRAC path a new one rotates the host's key."""
+    queue = WorkQueue()
+    queue.add("ns/a")
+    queue.add("ns/b")
+    queue.shutdown()
+
+    assert queue.get(timeout=0.05) is None
+
+
 def test_backoff_doubles_and_is_capped():
     backoff = ExponentialBackoff(base=1.0, maximum=8.0, jitter=0.0)
     assert [backoff.next_backoff("ns/a") for _ in range(6)] == [
