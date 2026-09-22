@@ -468,6 +468,7 @@ def _resolve_pending_request(
                 f"issuer. A new request will be created.",
                 reason=REASON_SIGNING_NOT_SIGNED,
                 pending_request=None,
+                next_retry=rfc3339(now_utc() + _RESTART_SIGNING_REQUEUE),
             )
             return Result(requeue_after=_RESTART_SIGNING_REQUEUE)
         log.info("[%s] signing request %s is pending: %s", ref, pending, detail)

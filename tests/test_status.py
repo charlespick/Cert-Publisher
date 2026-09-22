@@ -138,3 +138,14 @@ def test_a_failed_status_write_records_no_event():
     kube = _Broken()
     set_status(kube, _pub(), PUBLISHED, "Certificate published")
     assert kube.recorded == []
+
+
+def test_an_oversized_message_is_capped_on_status_too():
+    """Uncapped, a provisioner error dragging a whole transcript with it can
+    push the patch past the request limit, and then nothing is recorded."""
+    kube = _FakeKube()
+    set_status(kube, _pub(), ERROR, "x" * 100_000)
+
+    status = kube.patched[0]
+    assert len(status["message"]) == 32 * 1024
+    assert _ready(status)["message"] == status["message"]

@@ -115,6 +115,12 @@ class ControllerConfig:
     reconcile_timeout_seconds: float = 900.0
 
 
+# Watch failures that mean this pod has lost access, not that the connection
+# hiccuped: RBAC narrowed, credentials rejected, or the resource type removed
+# (a cert-manager uninstall takes its CRDs with it).
+_ACCESS_LOST = frozenset({401, 403, 404})
+
+
 class _Watcher:
     """One list/watch loop, on its own thread, feeding keys into the queue."""
 
@@ -142,8 +148,9 @@ class _Watcher:
         # Liveness: when this loop last showed it was not stuck -- a call that
         # returned, whether with events, a timeout, or an error.
         self._last_healthy = time.monotonic()
-        # Readiness: whether a list has ever succeeded, which is proof this
-        # pod can reach the apiserver with the RBAC it needs.
+        # Readiness: whether the last list succeeded and access has not been
+        # refused since -- proof this pod can hear about changes to this
+        # resource. Cleared on a 401/403/404, set again by the next good list.
         self.synced = False
         self.thread: threading.Thread | None = None
         # One loop, so one key -- but the jitter and the ceiling are the same
@@ -195,10 +202,23 @@ class _Watcher:
                 if exc.status == 410:
                     # The apiserver has compacted past our position. This is
                     # routine, not an error: relist and carry on without
-                    # backing off, so the gap stays as short as possible.
+                    # backing off, so the gap stays as short as possible --
+                    # but not faster than the reconnect floor, because a 410
+                    # that keeps coming back would otherwise be a hot
+                    # list-and-requeue-the-fleet loop.
                     log.info("[%s] watch expired; relisting", self._resource.label)
                     resource_version = None
+                    if self._pause_before_reconnect(started, stop_event):
+                        break
                     continue
+                if exc.status in _ACCESS_LOST:
+                    # Forbidden, unauthorised, or the resource type is gone:
+                    # not a blip. Until a list succeeds again this pod cannot
+                    # hear about changes, so it stops reporting ready; and a
+                    # position from before the gap is not worth resuming, since
+                    # whatever happened meanwhile went unseen.
+                    self.synced = False
+                    resource_version = None
                 # Any other failure keeps the position: the apiserver says 410
                 # when it is genuinely gone, so a blip is no reason to pay for
                 # a relist -- which, for publications, requeues the whole fleet.
@@ -208,12 +228,7 @@ class _Watcher:
                     break
                 log.exception("[%s] watch failed", self._resource.label)
             else:
-                # A watch that came back instantly -- rather than after the
-                # server-side timeout -- must not be reopened instantly too.
-                idle = self._config.watch_min_interval_seconds - (
-                    time.monotonic() - started
-                )
-                if idle > 0 and stop_event.wait(idle):
+                if self._pause_before_reconnect(started, stop_event):
                     break
                 continue
             # Only reached after a failure: wait before reconnecting so a
@@ -230,6 +245,15 @@ class _Watcher:
             if stop_event.wait(delay):
                 break
         log.debug("[%s] watcher stopped", self._resource.label)
+
+    def _pause_before_reconnect(self, started: float, stop_event: threading.Event) -> bool:
+        """Hold a reconnect to the floor interval; True if stopped meanwhile.
+
+        A watch that came back instantly -- rather than after the server-side
+        timeout -- must not be reopened instantly too.
+        """
+        idle = self._config.watch_min_interval_seconds - (time.monotonic() - started)
+        return idle > 0 and stop_event.wait(idle)
 
     def _sync(self) -> str:
         """List the resource and return the version to start watching from.
@@ -499,12 +523,14 @@ class Controller:
         return not still_running
 
     def ready(self) -> bool:
-        """Whether every watch has listed successfully at least once.
+        """Whether every watch has listed successfully and still has access.
 
         That is the proof this pod can reach the apiserver with the RBAC it
-        needs for all three resources -- a missing cert-manager CRD or a
-        missing grant keeps it unready, rather than running and quietly
-        never hearing about issuances.
+        needs for all three resources. A missing cert-manager CRD or a missing
+        grant -- at startup, or taken away while running -- makes it unready,
+        rather than running and quietly never hearing about issuances.
+        Liveness deliberately ignores a failing watch, since a restart would
+        not fix it, so this is where that failure shows.
         """
         return self._started and all(w.synced for w in self._watchers)
 

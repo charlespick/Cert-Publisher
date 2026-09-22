@@ -1070,6 +1070,8 @@ def test_a_never_signed_request_is_eventually_failed(monkeypatch):
     assert kube.status["phase"] == ERROR
     assert kube.deleted == ["r"]
     assert kube.status["pendingRequestName"] is None
+    # A retry is scheduled, so the status says when -- as every sibling does.
+    assert kube.status["nextRetryTime"]
 
 
 def test_a_recent_unsigned_request_is_still_waited_on(monkeypatch):

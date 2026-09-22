@@ -261,6 +261,62 @@ def test_a_watch_that_keeps_failing_is_not_reported_as_hung():
     thread.join(timeout=5)
 
 
+def test_losing_access_mid_run_makes_the_watcher_unready_until_it_relists():
+    """Liveness deliberately ignores a failing watch; readiness is where a
+    pod that can no longer hear about changes has to show it."""
+    custom = _FakeCustom([_pub("web01")], version="55")
+    watcher = _watcher(PUBLICATIONS, custom, [], [], backoff_base_seconds=0.01)
+    stop = threading.Event()
+    seen_ready = []
+
+    calls = []
+
+    def _fake_watch_from(resource_version, stop_event):
+        calls.append(resource_version)
+        if len(calls) == 1:
+            seen_ready.append(watcher.synced)  # listed fine at start
+            raise ApiException(status=403, reason="Forbidden")
+        seen_ready.append(watcher.synced)  # after the relist that follows
+        stop.set()
+        return resource_version
+
+    watcher._watch_from = _fake_watch_from
+    real_sync = watcher._sync
+
+    def _sync():
+        seen_ready.append(("before relist", watcher.synced))
+        return real_sync()
+
+    watcher._sync = _sync
+    thread = threading.Thread(target=watcher._run, args=(stop,), daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert seen_ready == [("before relist", False), True,
+                          ("before relist", False), True]
+    assert len(custom.list_calls) == 2, "resumed a stale position instead of relisting"
+
+
+def test_an_expired_watch_that_keeps_expiring_is_not_a_hot_loop():
+    """Each relist of publications requeues the fleet; a 410 on every attempt
+    must still be held to the reconnect floor."""
+    custom = _FakeCustom([_pub("web01")])
+    watcher = _watcher(PUBLICATIONS, custom, [], [], watch_min_interval_seconds=0.2)
+    stop = threading.Event()
+
+    def _fake_watch_from(resource_version, stop_event):
+        raise ApiException(status=410, reason="Gone")
+
+    watcher._watch_from = _fake_watch_from
+    thread = threading.Thread(target=watcher._run, args=(stop,), daemon=True)
+    thread.start()
+    thread.join(timeout=0.5)
+    stop.set()
+    thread.join(timeout=5)
+
+    assert len(custom.list_calls) <= 4, f"{len(custom.list_calls)} relists in 0.5s"
+
+
 def test_a_broken_watch_backs_off_before_reconnecting():
     """A watch the apiserver keeps rejecting -- missing RBAC, a missing CRD --
     must not become a hot loop against it."""

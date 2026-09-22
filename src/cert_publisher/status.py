@@ -141,6 +141,11 @@ def set_status(
     reason = reason or _DEFAULT_REASONS.get(phase, phase)
     previous = pub.get("status") or {}
 
+    # The same cap the condition carries. Nothing in the schema limits
+    # .status.message, but an oversized one -- a provisioner error dragging a
+    # whole script transcript with it -- can push the patch past the request
+    # size limit, and then nothing about this outcome is recorded at all.
+    message = message[:_MAX_MESSAGE]
     condition = _ready_condition(pub, phase, reason, message, ready)
     status: dict = {
         "phase": phase,

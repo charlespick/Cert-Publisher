@@ -303,8 +303,8 @@ helm install cert-publisher \
   --namespace cert-publisher --create-namespace
 ```
 
-This installs the CRD, RBAC, a ServiceAccount, and the controller Deployment
-(image `ghcr.io/charlespick/cert-publisher`). By default the controller
+This installs the CRD, RBAC, a ServiceAccount, and the controller as a
+single-replica StatefulSet (image `ghcr.io/charlespick/cert-publisher`). By default the controller
 reconciles `CertPublication`s across the whole cluster; scope it to one
 namespace with `--set config.watchNamespace=<namespace>`.
 
@@ -326,33 +326,42 @@ for the full list):
 | `image.tag` | chart `appVersion` | Controller image tag |
 | `config.logLevel` | `INFO` | Log level |
 | `config.watchNamespace` | `""` (whole cluster) | Namespace to scope reconciliation to |
-| `replicaCount` | `1` | Controller replicas; extras stand by for the lease |
 | `controller.workers` | `4` | Publications reconciled concurrently |
 | `controller.resyncInterval` | `1800` | Seconds between re-checks of a settled publication |
 | `controller.backoffBase` / `.backoffMax` | `5` / `900` | Retry backoff, in seconds, for a failing publication |
 | `controller.reconcileTimeout` | `900` | Seconds one reconcile may run before liveness treats the pod as wedged |
-| `leaderElection.enabled` | `true` | Elect one active replica via a `Lease` |
-| `podDisruptionBudget.enabled` | `false` | Only useful with `replicaCount > 1` |
 | `crds.install` | `true` | Install the `CertPublication` CRD with the release |
 
 The CRD carries a `helm.sh/resource-policy: keep` annotation, so uninstalling
 the release leaves the CRD and any `CertPublication`s in place.
 
+There is no replica count to set: the controller always runs as exactly one
+pod (see [One pod, never two](#one-pod-never-two)). `replicaCount`,
+`leaderElection.*` and `podDisruptionBudget.*` from earlier builds of the chart
+no longer exist, and Helm ignores them without complaint if they are still
+set.
+
 ### Upgrading from the CronJob
 
-`helm upgrade` and nothing else. Helm removes the `CronJob` and creates the
-`Deployment`; the CRD's `spec` schema is unchanged, so every existing
-`CertPublication` keeps working untouched. Two notes:
+`helm upgrade` and nothing else. Helm creates the `StatefulSet` and then
+removes the `CronJob`; the CRD's `spec` schema is unchanged, so every existing
+`CertPublication` keeps working untouched. Three notes:
+
+- Helm creates the new workload before deleting the old one. A CronJob run
+  already in progress when you upgrade can overlap the new controller's first
+  reconciles. To rule that out, suspend the CronJob directly
+  (`kubectl patch cronjob <name> -p '{"spec":{"suspend":true}}'`) and wait for
+  any running Job to finish before upgrading. (Setting `cronjob.suspend` in
+  Helm would instead keep the new controller scaled to zero.)
 
 - Values under `cronjob.` no longer do anything, except `cronjob.suspend`,
-  which still pauses the release (it now scales the Deployment to zero). If you
+  which still pauses the release (it now scales the StatefulSet to zero). If you
   were using `cronjob.schedule` to control how often hosts get re-checked, set
   `controller.resyncInterval` (in **seconds**) instead. The upgrade notes say
   so if the release still sets them.
 - The ClusterRole gains `list`/`watch` on cert-manager `Certificates` and
-  `CertificateRequests` and `create`/`patch` on Events, and a namespaced Role
-  for the leader-election `Lease`. All of that is in the chart; if you manage
-  RBAC yourself (`rbac.create=false`), apply the equivalent from
+  `CertificateRequests` and `create` on Events. All of that is in the chart;
+  if you manage RBAC yourself (`rbac.create=false`), apply the equivalent from
   [`charts/cert-publisher/templates/rbac.yaml`](charts/cert-publisher/templates/rbac.yaml).
 
 ## Development
@@ -367,11 +376,10 @@ The package lives in `src/cert_publisher/`:
 
 | Module | Responsibility |
 | --- | --- |
-| `main.py` | Entrypoint: leader election, signals, exit codes |
+| `main.py` | Entrypoint: signals, shutdown, exit codes |
 | `controller.py` | Watches, work queue, workers, backoff, resync |
 | `workqueue.py` | Deduplicating, rate-limited, delaying key queue |
-| `leader.py` | `Lease`-based leader election |
-| `health.py` | `/healthz`, `/readyz`, `/leader` |
+| `health.py` | `/healthz`, `/readyz` |
 | `reconcile.py` | Per-publication reconcile logic |
 | `status.py` | `.status`, conditions and Events |
 | `certmanager.py` | Builds the owned cert-manager `Certificate` |
