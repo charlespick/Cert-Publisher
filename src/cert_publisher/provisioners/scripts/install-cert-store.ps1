@@ -31,7 +31,13 @@ if ($Exportable) {
 }
 
 $collection = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
-$collection.Import($PfxBytes, $Password, $flags)
+# X509Certificate2Collection.Import has no SecureString overload on either
+# .NET Framework or .NET Core, and PowerShell binds a SecureString to its string
+# parameter by calling ToString() -- so passing $Password directly imports with
+# the literal "System.Security.SecureString" and fails with "The specified
+# network password is not correct". Unwrap it here, in this process only.
+$plainPassword = [System.Net.NetworkCredential]::new('', $Password).Password
+$collection.Import($PfxBytes, $plainPassword, $flags)
 try {
     $store = [Security.Cryptography.X509Certificates.X509Store]::new($StoreName, $location)
     $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)

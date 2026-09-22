@@ -557,6 +557,16 @@ def test_bundled_powershell_scripts_are_static_and_parameterised():
         assert "ConvertTo-SecureString" not in script
 
 
+
+def test_install_cert_store_unwraps_the_securestring_before_import():
+    from cert_publisher.provisioners import winrm as winrm_mod
+
+    script = winrm_mod._script("install-cert-store.ps1")
+    # Import has no SecureString overload; handing it $Password binds the
+    # string "System.Security.SecureString" as the PFX password.
+    assert "$collection.Import($PfxBytes, $Password," not in script
+    assert "NetworkCredential]::new('', $Password).Password" in script
+
 def test_winrm_invoke_raises_with_the_remote_error_text(monkeypatch):
     import pytest
 
