@@ -558,14 +558,20 @@ def test_bundled_powershell_scripts_are_static_and_parameterised():
 
 
 
-def test_install_cert_store_unwraps_the_securestring_before_import():
+def test_install_cert_store_imports_the_key_into_the_cng_ksp():
     from cert_publisher.provisioners import winrm as winrm_mod
 
     script = winrm_mod._script("install-cert-store.ps1")
-    # Import has no SecureString overload; handing it $Password binds the
-    # string "System.Security.SecureString" as the PFX password.
-    assert "$collection.Import($PfxBytes, $Password," not in script
-    assert "NetworkCredential]::new('', $Password).Password" in script
+    # X509Certificate2Collection.Import on .NET Framework puts the key in the
+    # legacy CAPI provider, which AD DS couldn't sign LDAPS handshakes with.
+    assert "X509Certificate2Collection]::new()" not in script
+    assert "PFXImportCertStore" in script
+    assert "PKCS12_ALWAYS_CNG_KSP = 0x00000200" in script
+    # The password is unwrapped only into unmanaged memory that gets zeroed,
+    # never into a managed string.
+    assert "SecureStringToGlobalAllocUnicode($Password)" in script
+    assert "ZeroFreeGlobalAllocUnicode($passwordPtr)" in script
+    assert "NetworkCredential" not in script
 
 def test_winrm_invoke_raises_with_the_remote_error_text(monkeypatch):
     import pytest
