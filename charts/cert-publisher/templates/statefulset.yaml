@@ -1,0 +1,145 @@
+{{- $replicas := 1 -}}
+{{- /*
+  Exactly one replica, by design. Publishing a certificate writes to a host,
+  and two pods doing it at once would install twice and, on the iDRAC path,
+  rotate the host's key out from under each other's pending request. A
+  single-replica StatefulSet guarantees at most one pod: unlike a Deployment,
+  it does not start a replacement until the old pod is confirmed gone -- on
+  a rollout, a drain, or a node that stops responding.
+*/ -}}
+{{- /*
+  Backwards compatibility with the CronJob this chart used to install:
+  `cronjob.suspend=true` was how a release was paused without uninstalling it,
+  and it keeps meaning that. Everything else under `cronjob.` is inert now --
+  NOTES.txt says so on upgrade.
+*/ -}}
+{{- if .Values.cronjob -}}
+{{- if .Values.cronjob.suspend -}}
+{{- $replicas = 0 -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cert-publisher.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cert-publisher.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  # Required by older API servers. Nothing addresses this pod by DNS, so no
+  # Service is created for it.
+  serviceName: {{ include "cert-publisher.fullname" . }}
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "cert-publisher.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cert-publisher.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cert-publisher.serviceAccountName" . }}
+      # Must exceed controller.shutdownTimeout: a reconcile caught mid-publish
+      # is talking SSH or WS-Man to a host and cannot be interrupted safely, so
+      # it is given that long to finish before the pod is killed.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: cert-publisher
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.healthProbe.port }}
+              protocol: TCP
+          env:
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            # Leave WATCH_NAMESPACE empty to reconcile the whole cluster.
+            - name: WATCH_NAMESPACE
+              value: {{ .Values.config.watchNamespace | quote }}
+            # Identifies this pod in the Events it records.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HEALTH_PORT
+              value: {{ .Values.healthProbe.port | quote }}
+            - name: WORKER_COUNT
+              value: {{ .Values.controller.workers | quote }}
+            - name: RESYNC_INTERVAL
+              value: {{ .Values.controller.resyncInterval | quote }}
+            - name: RESYNC_JITTER
+              value: {{ .Values.controller.resyncJitter | quote }}
+            - name: STARTUP_SPREAD
+              value: {{ .Values.controller.startupSpread | quote }}
+            - name: BACKOFF_BASE
+              value: {{ .Values.controller.backoffBase | quote }}
+            - name: BACKOFF_MAX
+              value: {{ .Values.controller.backoffMax | quote }}
+            - name: WATCH_TIMEOUT
+              value: {{ .Values.controller.watchTimeout | quote }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ .Values.controller.shutdownTimeout | quote }}
+            - name: RECONCILE_TIMEOUT
+              value: {{ .Values.controller.reconcileTimeout | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Liveness fails when a watch has gone silent -- neither delivering
+          # events nor erroring -- or a reconcile has hung, neither of which
+          # waiting fixes. Readiness passes once every watch has listed, which
+          # proves the pod can reach the apiserver with the RBAC it needs.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.healthProbe.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthProbe.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthProbe.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthProbe.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: {{ .Values.healthProbe.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthProbe.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthProbe.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthProbe.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -673,9 +673,13 @@ def test_winrm_accepts_legacy_pywinrm_transport_names():
 class _FakeKube:
     def __init__(self):
         self.patched = None
+        self.recorded = []
 
     def patch_publication_status(self, namespace, name, status):
         self.patched = (namespace, name, status)
+
+    def record_event(self, pub, event_type, reason, message):
+        self.recorded.append((event_type, reason, message))
 
 
 def test_set_status_patches_expected_fields():

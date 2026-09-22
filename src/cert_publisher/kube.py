@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 
 from kubernetes import client
 from kubernetes import config as kube_config
 from kubernetes.client.rest import ApiException
 
+from .utils import now_rfc3339
+
 log = logging.getLogger("cert-publisher.kube")
+
+KIND = "CertPublication"
 
 # The CertPublication custom resource this operator reconciles.
 GROUP = "certpublisher.makerland.xyz"
@@ -27,20 +32,32 @@ CM_CR_PLURAL = "certificaterequests"
 
 
 class Kube:
-    def __init__(self) -> None:
+    def __init__(self, *, reporter: str = "cert-publisher") -> None:
         try:
             kube_config.load_incluster_config()
         except kube_config.ConfigException:
             kube_config.load_kube_config()
         self.custom = client.CustomObjectsApi()
         self.core = client.CoreV1Api()
+        # Names this process in the Events it emits.
+        self.reporter = reporter
+        self.instance = os.environ.get("POD_NAME") or reporter
 
-    def list_publications(self, namespace: str | None = None) -> list[dict]:
-        if namespace:
-            resp = self.custom.list_namespaced_custom_object(GROUP, VERSION, namespace, PLURAL)
-        else:
-            resp = self.custom.list_cluster_custom_object(GROUP, VERSION, PLURAL)
-        return resp.get("items", [])
+    def get_publication(self, namespace: str, name: str) -> dict | None:
+        """Read one publication, or None if it has been deleted.
+
+        The controller works from keys rather than from the objects in watch
+        events, and re-reads here, so a reconcile always acts on the current
+        spec rather than on whichever event happened to wake it.
+        """
+        try:
+            return self.custom.get_namespaced_custom_object(
+                GROUP, VERSION, namespace, PLURAL, name
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
 
     def get_certificate(self, namespace: str, name: str) -> dict | None:
         try:
@@ -122,3 +139,52 @@ class Kube:
     def secret_data(secret) -> dict[str, bytes]:
         """Decode a V1Secret's ``data`` map to raw bytes."""
         return {k: base64.b64decode(v) for k, v in (secret.data or {}).items()}
+
+    def record_event(self, pub: dict, event_type: str, reason: str, message: str) -> None:
+        """Attach an Event to a publication, so ``kubectl describe`` shows it.
+
+        Best-effort in the strictest sense: an operator that cannot write an
+        Event has still done its job, and the same outcome is already on
+        ``.status`` and in the logs. Events are also the one write here that a
+        namespace ResourceQuota can legitimately refuse.
+        """
+        meta = pub["metadata"]
+        namespace = meta["namespace"]
+        stamp = now_rfc3339()
+        body = {
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                # generateName rather than a name we compose: two transitions
+                # in the same second, or an old pod and its replacement, must
+                # not collide on it.
+                "generateName": f"{meta['name']}.",
+                "namespace": namespace,
+            },
+            "involvedObject": {
+                "apiVersion": f"{GROUP}/{VERSION}",
+                "kind": KIND,
+                "name": meta["name"],
+                "namespace": namespace,
+                "uid": meta.get("uid"),
+                "resourceVersion": meta.get("resourceVersion"),
+            },
+            "type": event_type,
+            "reason": reason,
+            # The apiserver caps this; a provisioner traceback can exceed it.
+            "message": message[:1024],
+            # The legacy timestamp fields, deliberately: setting eventTime
+            # switches the apiserver to validating this as a v1beta1-style
+            # event, which then requires fields this one has no use for.
+            "firstTimestamp": stamp,
+            "lastTimestamp": stamp,
+            "count": 1,
+            "source": {"component": self.reporter},
+            "reportingComponent": self.reporter,
+            "reportingInstance": self.instance,
+        }
+        try:
+            self.core.create_namespaced_event(namespace, body)
+        except Exception:
+            log.debug("could not record event for %s/%s", namespace, meta["name"],
+                      exc_info=True)

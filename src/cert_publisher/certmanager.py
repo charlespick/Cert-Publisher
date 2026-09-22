@@ -6,7 +6,7 @@ import base64
 
 from cryptography import x509
 
-from .kube import CM_GROUP, CM_VERSION, GROUP, VERSION
+from .kube import CM_GROUP, CM_VERSION, GROUP, KIND, VERSION
 
 # Fields we pass straight through from the CertPublication spec to the
 # cert-manager Certificate spec when present.
@@ -17,7 +17,7 @@ def _owner_reference(pub: dict) -> dict:
     meta = pub["metadata"]
     return {
         "apiVersion": f"{GROUP}/{VERSION}",
-        "kind": "CertPublication",
+        "kind": KIND,
         "name": meta["name"],
         "uid": meta["uid"],
         "controller": True,

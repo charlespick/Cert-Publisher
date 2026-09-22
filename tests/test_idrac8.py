@@ -62,6 +62,7 @@ class _FakeKube:
         self.deleted = []
         self.status = {}
         self.events = []
+        self.recorded = []
 
     def get_certificate_request(self, namespace, name):
         return self.request
@@ -80,6 +81,9 @@ class _FakeKube:
 
     def get_secret(self, namespace, name):
         return None
+
+    def record_event(self, pub, event_type, reason, message):
+        self.recorded.append((event_type, reason, message))
 
 
 def _csr(cn="idrac01.example.com", key_usage=True) -> bytes:
@@ -740,6 +744,72 @@ def test_reconcile_recovers_when_the_pending_request_vanished(monkeypatch):
     assert kube.status["phase"] == PENDING
 
 
+@pytest.mark.parametrize("request_obj", [
+    None,  # vanished
+    {"status": {"conditions": [{"type": "Denied", "status": "True", "message": "no"}]}},
+], ids=["vanished", "denied"])
+def test_a_restarted_round_inside_the_cooldown_says_when_it_will_actually_run(
+    monkeypatch, request_obj
+):
+    """The next round is held by the signing cooldown, so a promise to retry
+    in seconds would be false: the retry is scheduled, and reported, for when
+    the cooldown ends."""
+    kube = _FakeKube(request=request_obj)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": _stamp(datetime.timedelta(minutes=-10)),
+    }))
+
+    assert datetime.timedelta(minutes=49) < result.requeue_after <= datetime.timedelta(
+        minutes=51
+    )
+    assert "signing cooldown ends in" in kube.status["message"]
+    retry_at = datetime.datetime.strptime(
+        kube.status["nextRetryTime"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=datetime.UTC)
+    assert retry_at - datetime.datetime.now(datetime.UTC) > datetime.timedelta(minutes=49)
+
+
+def test_a_restarted_round_past_the_cooldown_retries_straight_away(monkeypatch):
+    kube = _FakeKube(request=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": _stamp(datetime.timedelta(hours=-2)),
+    }))
+
+    assert result.requeue_after == datetime.timedelta(seconds=5)
+    assert "cooldown" not in kube.status["message"]
+
+
+def test_the_scheduled_retry_really_does_open_a_new_round(monkeypatch):
+    """Where the old code promised a 5s retry and then hit the cooldown."""
+    kube = _FakeKube(request=None)
+    prov = _FakeProv(installed=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: prov)
+    signed_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=10)
+    pub = _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "lastSigningTime": signed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+    # set_status keeps pub["status"] merged the way the apiserver would, so
+    # lastSigningTime survives into the next pass exactly as it would live.
+    result = reconcile_mod.reconcile_publication(kube, pub)
+    assert pub["status"]["lastSigningTime"]
+
+    # Move the clock to when the retry was scheduled for.
+    later = datetime.datetime.now(datetime.UTC) + result.requeue_after
+    monkeypatch.setattr(reconcile_mod, "now_utc", lambda: later)
+    reconcile_mod.reconcile_publication(kube, pub)
+
+    assert prov.csr_args is not None, "the scheduled retry still hit the cooldown"
+    assert kube.status["phase"] == PENDING
+
+
 def test_reconcile_keeps_the_request_when_the_import_fails(monkeypatch):
     """A failed import must not rotate the host key for a fresh CSR next run."""
     signed = _cert()
@@ -864,6 +934,88 @@ def test_ca_bundle_replaces_the_system_trust_store(monkeypatch):
 # -- review follow-ups: reconcile safety -----------------------------------
 
 
+# -- Ready through a renewal ----------------------------------------------
+
+_READY_TRUE = [{"type": "Ready", "status": "True", "reason": "Published",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"}]
+
+
+def _ready(kube):
+    return next(c for c in kube.status["conditions"] if c["type"] == "Ready")
+
+
+def test_a_routine_renewal_stays_ready_while_it_is_signed(monkeypatch):
+    """The host is still serving a good certificate; an alert on Ready must
+    not fire just because the next one is on its way."""
+    pem = _cert(days_valid=300, age_days=250)
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner",
+                        lambda *a: _FakeProv(installed=pem))
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "publishedFingerprint": sha256_fingerprint(pem), "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == PENDING
+    ready = _ready(kube)
+    assert ready["status"] == "True"
+    assert ready["reason"] == "SigningRequestPending"
+    assert ready["lastTransitionTime"] == "2026-01-01T00:00:00Z"
+
+
+def test_an_expired_certificate_is_not_ready_while_it_is_replaced(monkeypatch):
+    pem = _cert(days_valid=30, age_days=40)
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner",
+                        lambda *a: _FakeProv(installed=pem))
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "publishedFingerprint": sha256_fingerprint(pem), "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == PENDING
+    assert _ready(kube)["status"] == "False"
+
+
+def test_renewal_reason_tells_expiry_from_a_routine_renewal():
+    pem = _cert(days_valid=30, age_days=40)
+    status = {"publishedFingerprint": sha256_fingerprint(pem)}
+    reason = reconcile_mod._renewal_reason(pem, _pub()["spec"], status)
+    assert "expired" in reason
+
+
+@pytest.mark.parametrize("was_ready", ["True", "False"])
+def test_waiting_on_issuance_keeps_whatever_readiness_the_round_began_with(
+    monkeypatch, was_ready
+):
+    kube = _FakeKube(request={"status": {"conditions": []}})
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc",
+        "conditions": [{"type": "Ready", "status": was_ready}],
+    }))
+
+    assert kube.status["phase"] == PENDING
+    assert _ready(kube)["status"] == was_ready
+
+
+def test_a_signing_round_that_is_never_answered_is_not_ready(monkeypatch):
+    """Readiness carried through a round must not outlive the round."""
+    kube = _FakeKube(request={
+        "metadata": {"creationTimestamp": _stamp(datetime.timedelta(hours=-2))},
+        "status": {"conditions": []},
+    })
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "idrac01-abc", "conditions": _READY_TRUE,
+    }))
+
+    assert kube.status["phase"] == ERROR
+    assert _ready(kube)["status"] == "False"
+
+
 def _stamp(delta):
     return (datetime.datetime.now(datetime.UTC) + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -918,6 +1070,8 @@ def test_a_never_signed_request_is_eventually_failed(monkeypatch):
     assert kube.status["phase"] == ERROR
     assert kube.deleted == ["r"]
     assert kube.status["pendingRequestName"] is None
+    # A retry is scheduled, so the status says when -- as every sibling does.
+    assert kube.status["nextRetryTime"]
 
 
 def test_a_recent_unsigned_request_is_still_waited_on(monkeypatch):
@@ -1031,7 +1185,8 @@ def test_no_request_is_created_when_its_name_cannot_be_recorded(monkeypatch):
 
 
 def test_the_cooldown_message_does_not_claim_an_import_happened(monkeypatch):
-    """lastSigningTime is stamped at CSR generation, before anything is signed."""
+    """lastSigningTime is stamped before the CSR is generated, so nothing has
+    been signed -- let alone imported -- by the time it applies."""
     kube = _FakeKube()
     monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv(installed=None))
 
@@ -1042,6 +1197,113 @@ def test_the_cooldown_message_does_not_claim_an_import_happened(monkeypatch):
     message = kube.status["message"]
     assert "signing round started" in message
     assert "was signed and imported" not in message
+
+
+def test_the_cooldown_says_when_it_will_try_again(monkeypatch):
+    """Every other Error state carries nextRetryTime. The one path that
+    schedules its own requeue must not be the one that leaves it blank."""
+    from cert_publisher.utils import now_utc, parse_rfc3339
+
+    kube = _FakeKube()
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv(installed=None))
+
+    result = reconcile_mod.reconcile_publication(
+        kube, _pub(status={"lastSigningTime": _stamp(datetime.timedelta(minutes=-5))})
+    )
+
+    assert result.requeue_after is not None
+    assert kube.status["nextRetryTime"], "scheduled a retry without saying when"
+    # The field and the requeue have to describe the same moment.
+    drift = parse_rfc3339(kube.status["nextRetryTime"]) - (now_utc() + result.requeue_after)
+    assert abs(drift.total_seconds()) < 5
+
+
+# -- review round 3 --------------------------------------------------------
+
+
+def test_the_cooldown_is_stamped_before_the_host_key_is_rotated(monkeypatch):
+    """Generating a CSR resets the BMC and is not undoable, so the throttle
+    has to be recorded first. Stamped afterwards, a status write that failed
+    would leave a rotated key with nothing holding the retry back, and the
+    backoff would rotate again at 5s, 10s, 20s."""
+    class _StatusFails(_FakeKube):
+        def patch_publication_status(self, namespace, name, status):
+            raise RuntimeError("api server said no")
+
+    kube = _StatusFails()
+    prov = _FakeProv(installed=None)
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: prov)
+
+    with pytest.raises(RuntimeError, match="api server said no"):
+        reconcile_mod.reconcile_publication(kube, _pub())
+
+    assert prov.csr_args is None, "rotated the host's key without recording it"
+    assert kube.created == []
+
+
+def test_a_rotated_key_is_throttled_even_when_the_round_dies_after_it(monkeypatch):
+    """The stamp is what stops the next pass rotating again, so it has to
+    survive a round that falls over once the key is already gone."""
+    class _Exploding(_FakeProv):
+        def generate_csr(self, *, common_name, dns_names):
+            raise RuntimeError("bmc went away mid-rotation")
+
+    kube = _FakeKube()
+    monkeypatch.setattr(
+        reconcile_mod, "build_provisioner", lambda *a: _Exploding(installed=None)
+    )
+
+    with pytest.raises(RuntimeError, match="bmc went away"):
+        reconcile_mod.reconcile_publication(kube, _pub())
+
+    assert kube.status["lastSigningTime"], "a retry would rotate the key again"
+
+
+def test_an_unusable_signed_certificate_waits_out_the_signing_cooldown(monkeypatch):
+    """The resync lands inside the hour-long cooldown, so a bare requeue would
+    have the next pass overwrite this diagnosis with the cooldown's generic
+    one -- and record an Event for a transition that is not one."""
+    from cert_publisher.status import REASON_UNUSABLE_CERTIFICATE
+    from cert_publisher.utils import now_utc, parse_rfc3339
+
+    signed = _cert(dns=("wrong.example.com",))
+    kube = _FakeKube(request={
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "certificate": base64.b64encode(signed).decode(),
+        }
+    })
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(kube, _pub(status={
+        "pendingRequestName": "r",
+        "lastSigningTime": _stamp(datetime.timedelta(minutes=-50)),
+    }))
+
+    # Roughly the ten minutes left of the cooldown, not the resync interval.
+    assert datetime.timedelta(minutes=9) < result.requeue_after < datetime.timedelta(minutes=11)
+    assert kube.status["reason"] == REASON_UNUSABLE_CERTIFICATE
+    due = parse_rfc3339(kube.status["nextRetryTime"]) - now_utc()
+    assert abs(due - result.requeue_after) < datetime.timedelta(seconds=5)
+
+
+def test_an_unusable_certificate_outside_the_cooldown_retries_at_once(monkeypatch):
+    """Nothing is holding a fresh round back, so there is no reason to wait."""
+    signed = _cert(dns=("wrong.example.com",))
+    kube = _FakeKube(request={
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "certificate": base64.b64encode(signed).decode(),
+        }
+    })
+    monkeypatch.setattr(reconcile_mod, "build_provisioner", lambda *a: _FakeProv())
+
+    result = reconcile_mod.reconcile_publication(
+        kube, _pub(status={"pendingRequestName": "r"})
+    )
+
+    assert result.requeue_after == reconcile_mod._RESTART_SIGNING_REQUEUE
+    assert kube.status["nextRetryTime"]
 
 
 # -- first contact with real hardware --------------------------------------
@@ -1133,7 +1395,7 @@ def test_the_cooldown_still_holds_when_the_spec_is_unchanged(monkeypatch):
 
     assert prov.csr_args is None
     assert kube.status["phase"] == ERROR
-    assert "Editing the publication retries immediately" in kube.status["message"]
+    assert "Editing the publication's spec retries immediately" in kube.status["message"]
 
 
 def test_extended_key_usages_are_derived_when_the_csr_carries_them():

@@ -99,8 +99,9 @@ class _UnattendedUI(PSHostUserInterface):
     makes a host call: pypsrp logs a warning and sends no response, so the
     pipeline waits for an answer that never comes while ``poll_invoke``
     silently swallows each WSMan operation timeout and asks again -- wedging
-    the CronJob run, which reconciles publications serially. The old
-    ``powershell.exe`` path failed fast instead, because stdin was closed.
+    the worker reconciling this publication, and with it any other publication
+    the queue hands that worker. The old ``powershell.exe`` path failed fast
+    instead, because stdin was closed.
 
     Anything that prompts is a bug in an unattended hook, so refuse it loudly
     and immediately. Non-interactive host calls (writes, progress, buffer

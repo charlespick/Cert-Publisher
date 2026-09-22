@@ -16,4 +16,8 @@ COPY --from=build /dist/*.whl /tmp/
 RUN python -m pip install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl
 
 USER 1001
+
+# Liveness and readiness probes; the operator serves nothing else.
+EXPOSE 8080
+
 ENTRYPOINT ["cert-publisher"]
